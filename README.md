@@ -45,6 +45,12 @@ The mailbox tools are:
 - `mailbox_send`
 - `mailbox_inbox`
 - `mailbox_read`
+- `trace_events`
+- `finding_emit`
+- `findings_list`
+- `finding_read`
+- `verdict_record`
+- `verdicts_list`
 
 ## Use
 
@@ -79,6 +85,21 @@ agent code bridge --from human --to claude --mode review --dry-run \
   --prompt "Show the command you would run."
 ```
 
+Run a bounded adversarial loop:
+
+```bash
+agent code loop --builder codex --critic claude --verifier claude --max-turns 1 \
+  --prompt "Implement the scoped change and look for blocking defects."
+```
+
+Inspect trace events and structured findings:
+
+```bash
+agent code trace --run-id run_...
+agent code findings create --run-id run_... --severity high --claim "..."
+agent code verdicts record --run-id run_... --status fail --summary "..."
+```
+
 ## State
 
 Runtime state is outside repositories:
@@ -86,6 +107,9 @@ Runtime state is outside repositories:
 ```text
 ~/.local/state/agent-bridge/
   bridge_agents.log
+  events.jsonl
+  findings.jsonl
+  verdicts.jsonl
   transcripts/
   mailbox/messages.jsonl
 ```

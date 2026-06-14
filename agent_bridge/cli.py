@@ -13,7 +13,6 @@ the caller is Codex or Claude.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -22,6 +21,18 @@ import shutil
 import subprocess
 import sys
 from typing import Any
+
+from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, safe_fragment, utc_stamp
+from .findings import (
+    create_finding,
+    format_findings,
+    format_verdicts,
+    list_findings,
+    list_verdicts,
+    read_finding,
+    record_verdict,
+)
+from .trace import emit_event, events_path, format_events, load_events
 
 
 BRIDGE_DIR = Path(__file__).resolve().parent
@@ -80,10 +91,6 @@ def run_git(args: list[str]) -> str:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return ""
-
-
-def utc_stamp() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def resolve_command(agent: dict[str, Any]) -> str:
@@ -182,19 +189,22 @@ def read_prompt(args: argparse.Namespace) -> str:
     return ""
 
 
-def build_scope(source: str, target: dict[str, Any], mode: str) -> str:
+def build_scope(source: str, target: dict[str, Any], mode: str, meta: dict[str, Any] | None = None) -> str:
     branch = run_git(["branch", "--show-current"]) or "unknown"
     head = run_git(["rev-parse", "--short", "HEAD"]) or "unknown"
     status = run_git(["status", "--short", "--branch"]) or "unknown"
     target_label = target.get("label", target["id"])
     action = "edit local files and run local tests" if mode == "code" else "return analysis only"
     no_edit = "" if mode == "code" else " Do not modify files."
+    meta = meta or {}
+    correlation = format_meta(meta) or "none"
     return f"""[AGENT CODE BRIDGE - {mode.upper()}]
 You are {target_label}, invoked headlessly by {source} through a generic local agent bridge.
 
 Project: {PROJECT_DIR}
 Branch: {branch}
 HEAD: {head}
+Correlation: {correlation}
 Git status at dispatch:
 {status}
 
@@ -250,8 +260,6 @@ def command_for_agent(
             str(PROJECT_DIR),
             "-s",
             sandbox,
-            "-a",
-            "never",
         ]
     if adapter == "argv":
         templates = agent.get(f"{mode}_args") or agent.get("args")
@@ -270,11 +278,22 @@ def command_for_agent(
     raise BridgeError(f"agent {agent['id']} has unsupported adapter {adapter!r}")
 
 
-def write_header(transcript: Path, *, source: str, target: str, mode: str, prompt: str, cmd: list[str]) -> None:
+def write_header(
+    transcript: Path,
+    *,
+    source: str,
+    target: str,
+    mode: str,
+    prompt: str,
+    cmd: list[str],
+    meta: dict[str, Any] | None = None,
+) -> None:
     safe_cmd = [cmd[0], *("<prompt/scope>" if part.startswith("[AGENT CODE BRIDGE") else part for part in cmd[1:])]
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(f"=== Agent bridge request {utc_stamp()} ===\n")
         handle.write(f"project: {PROJECT_DIR}\nsource: {source}\ntarget: {target}\nmode: {mode}\n")
+        if meta:
+            handle.write(f"correlation: {format_meta(meta)}\n")
         handle.write(f"command: {shlex.join(safe_cmd)}\n\n")
         handle.write(prompt)
         handle.write("\n\n=== Agent response ===\n")
@@ -288,16 +307,32 @@ def invoke_target(
     prompt: str,
     budget_usd: str,
     dry_run: bool,
+    meta: dict[str, Any] | None = None,
 ) -> int:
-    scope = build_scope(source, agent, mode)
+    meta = meta or {}
+    scope = build_scope(source, agent, mode, meta)
     cmd = command_for_agent(agent, source=source, mode=mode, prompt=prompt, scope=scope, budget_usd=budget_usd)
+    emit_event(
+        "agent.dispatched",
+        run_id=meta.get("run_id"),
+        meta=meta,
+        data={"target": agent["id"], "mode": mode, "dry_run": dry_run, "project_dir": str(PROJECT_DIR)},
+    )
     if dry_run:
         print(f"[dry-run] {agent['id']}: {shlex.join(cmd)}")
+        emit_event(
+            "agent.completed",
+            run_id=meta.get("run_id"),
+            meta=meta,
+            data={"target": agent["id"], "mode": mode, "return_code": 0, "dry_run": True},
+        )
         return 0
 
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    transcript = TRANSCRIPT_DIR / f"{agent['id']}_{utc_stamp()}.txt"
-    write_header(transcript, source=source, target=agent["id"], mode=mode, prompt=prompt, cmd=cmd)
+    prefix = safe_fragment(meta.get("run_id", agent["id"]))
+    turn = safe_fragment(meta.get("turn_id", utc_stamp()))
+    transcript = TRANSCRIPT_DIR / f"{prefix}_{turn}_{agent['id']}_{utc_stamp()}.txt"
+    write_header(transcript, source=source, target=agent["id"], mode=mode, prompt=prompt, cmd=cmd, meta=meta)
 
     with transcript.open("a", encoding="utf-8") as transcript_handle, BRIDGE_LOG.open("a", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
@@ -314,6 +349,12 @@ def invoke_target(
             transcript_handle.write(line)
             log_handle.write(line)
         rc = process.wait()
+    emit_event(
+        "agent.completed",
+        run_id=meta.get("run_id"),
+        meta=meta,
+        data={"target": agent["id"], "mode": mode, "return_code": rc, "dry_run": False, "transcript": str(transcript)},
+    )
     print(f"\n[transcript] {transcript}", file=sys.stderr)
     return rc
 
@@ -332,6 +373,7 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
     parser.add_argument("--list", action="store_true", help="List configured agents and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print target commands without invoking agents")
+    add_meta_args(parser)
     return parser.parse_args(argv)
 
 
@@ -357,8 +399,21 @@ def bridge(argv: list[str]) -> int:
         raise BridgeError("at least one target agent is required")
 
     targets = resolve_agent_ids(args.targets, agents)
+    base_meta = ensure_run_meta(extract_meta(args))
+    emit_event(
+        "run.created",
+        run_id=base_meta.get("run_id"),
+        meta=base_meta,
+        data={"command": "bridge", "source": source, "mode": mode, "targets": targets, "dry_run": args.dry_run},
+    )
     rc = 0
     for target_id in targets:
+        target_meta = child_turn_meta(
+            base_meta,
+            role=target_id,
+            attempt=int(base_meta.get("attempt", 1)),
+            parent_id=base_meta.get("parent_id"),
+        )
         target_rc = invoke_target(
             agents[target_id],
             source=source,
@@ -366,29 +421,281 @@ def bridge(argv: list[str]) -> int:
             prompt=prompt,
             budget_usd=str(args.budget_usd),
             dry_run=args.dry_run,
+            meta=target_meta,
         )
         if target_rc != 0:
             rc = target_rc
+    emit_event(
+        "run.completed",
+        run_id=base_meta.get("run_id"),
+        meta=base_meta,
+        data={"command": "bridge", "return_code": rc, "dry_run": args.dry_run},
+    )
+    return rc
+
+
+def _json_print(value: Any) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _comma_values(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    out: list[str] = []
+    for value in values:
+        out.extend(part.strip() for part in value.split(",") if part.strip())
+    return out
+
+
+def trace_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code trace", description="Inspect agent bridge trace events.")
+    parser.add_argument("--run-id")
+    parser.add_argument("--type", dest="event_type")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    rows = load_events(run_id=args.run_id, event_type=args.event_type)
+    if args.json:
+        _json_print(rows)
+    else:
+        print(format_events(rows))
+    return 0
+
+
+def findings_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code findings", description="Create and inspect structured findings.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    create = sub.add_parser("create")
+    create.add_argument("--run-id", required=True)
+    create.add_argument("--severity", required=True)
+    create.add_argument("--claim", required=True)
+    create.add_argument("--evidence", action="append")
+    create.add_argument("--reproduction", default="")
+    create.add_argument("--status", default="open")
+    create.add_argument("--owner-role", default="")
+    create.add_argument("--rebuttal", default="")
+    create.add_argument("--resolution", default="")
+    create.add_argument("--json", action="store_true")
+
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--run-id")
+    list_parser.add_argument("--status")
+    list_parser.add_argument("--severity")
+    list_parser.add_argument("--json", action="store_true")
+
+    read = sub.add_parser("read")
+    read.add_argument("id")
+    read.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "create":
+        row = create_finding(
+            run_id=args.run_id,
+            severity=args.severity,
+            claim=args.claim,
+            evidence=args.evidence,
+            reproduction=args.reproduction,
+            status=args.status,
+            owner_role=args.owner_role,
+            rebuttal=args.rebuttal,
+            resolution=args.resolution,
+        )
+        _json_print(row) if args.json else print(row["id"])
+        return 0
+    if args.cmd == "list":
+        rows = list_findings(run_id=args.run_id, status=args.status, severity=args.severity)
+        _json_print(rows) if args.json else print(format_findings(rows))
+        return 0
+    row = read_finding(args.id)
+    if row is None:
+        raise BridgeError(f"no finding {args.id}")
+    _json_print(row) if args.json else print(format_findings([row]))
+    return 0
+
+
+def verdicts_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code verdicts", description="Record and inspect loop verdicts.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    record = sub.add_parser("record")
+    record.add_argument("--run-id", required=True)
+    record.add_argument("--status", required=True)
+    record.add_argument("--summary", required=True)
+    record.add_argument("--blocking-finding", action="append", dest="blocking_findings")
+    record.add_argument("--evidence", action="append")
+    record.add_argument("--json", action="store_true")
+
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--run-id")
+    list_parser.add_argument("--status")
+    list_parser.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "record":
+        row = record_verdict(
+            run_id=args.run_id,
+            status=args.status,
+            summary=args.summary,
+            blocking_findings=_comma_values(args.blocking_findings),
+            evidence=args.evidence,
+        )
+        _json_print(row) if args.json else print(row["id"])
+        return 0
+    rows = list_verdicts(run_id=args.run_id, status=args.status)
+    _json_print(rows) if args.json else print(format_verdicts(rows))
+    return 0
+
+
+def parse_loop_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="agent code loop",
+        description="Run a bounded builder -> critic -> verifier adversarial loop.",
+    )
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to bridge agent config JSON")
+    parser.add_argument("--project-dir", help="Project/worktree directory. Defaults to the current git root.")
+    parser.add_argument("--from", dest="source", default=os.environ.get("AGENT_BRIDGE_CALLER", "human"))
+    parser.add_argument("--builder", default="codex", help="Agent id for code/build turns")
+    parser.add_argument("--critic", default="claude", help="Agent id for adversarial review turns")
+    parser.add_argument("--verifier", default="claude", help="Agent id for final verification turns")
+    parser.add_argument("--max-turns", type=int, default=1)
+    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    parser.add_argument("--prompt", help="Loop task prompt. If omitted in non-interactive mode, stdin is used.")
+    parser.add_argument("--dry-run", action="store_true", help="Print planned dispatches without invoking agents")
+    add_meta_args(parser)
+    return parser.parse_args(argv)
+
+
+def _loop_prompt(*, role: str, attempt: int, original_prompt: str, run_id: str, loop_id: str) -> str:
+    return f"""[ADVERSARIAL LOOP]
+Run: {run_id}
+Loop: {loop_id}
+Role: {role}
+Attempt: {attempt}
+
+Original task:
+{original_prompt}
+
+Role contract:
+- builder: implement the requested change and run focused tests.
+- critic: inspect the current worktree for concrete defects and emit structured findings when available.
+- verifier: smoke test the current worktree and record whether blocking issues remain.
+
+Report files changed, checks run, and any blocking findings or verdicts.
+"""
+
+
+def loop(argv: list[str]) -> int:
+    global PROJECT_DIR
+    args = parse_loop_args(argv)
+    if args.max_turns < 1:
+        raise BridgeError("--max-turns must be at least 1")
+    PROJECT_DIR = Path(args.project_dir).expanduser().resolve() if args.project_dir else discover_project_dir()
+    config = load_config(Path(args.config))
+    agents = agent_map(config)
+    for target in (args.builder, args.critic, args.verifier):
+        if target not in agents:
+            raise BridgeError(f"unknown loop agent {target!r}")
+
+    original_prompt = read_prompt(args)
+    if not original_prompt:
+        raise BridgeError("a loop task prompt is required")
+
+    base_meta = ensure_run_meta(extract_meta(args))
+    base_meta.setdefault("loop_id", base_meta.get("run_id", "run").replace("run_", "loop_", 1))
+    emit_event(
+        "run.created",
+        run_id=base_meta.get("run_id"),
+        meta=base_meta,
+        data={
+            "command": "loop",
+            "source": args.source,
+            "builder": args.builder,
+            "critic": args.critic,
+            "verifier": args.verifier,
+            "max_turns": args.max_turns,
+            "dry_run": args.dry_run,
+        },
+    )
+
+    rc = 0
+    parent_id = base_meta.get("parent_id")
+    for attempt in range(1, args.max_turns + 1):
+        phases = [
+            ("builder", args.builder, "code"),
+            ("critic", args.critic, "review"),
+            ("verifier", args.verifier, "review"),
+        ]
+        for role, target_id, mode in phases:
+            turn_meta = child_turn_meta(base_meta, role=role, attempt=attempt, parent_id=parent_id)
+            prompt = _loop_prompt(
+                role=role,
+                attempt=attempt,
+                original_prompt=original_prompt,
+                run_id=str(turn_meta["run_id"]),
+                loop_id=str(turn_meta["loop_id"]),
+            )
+            target_rc = invoke_target(
+                agents[target_id],
+                source=args.source,
+                mode=mode,
+                prompt=prompt,
+                budget_usd=str(args.budget_usd),
+                dry_run=args.dry_run,
+                meta=turn_meta,
+            )
+            parent_id = str(turn_meta["turn_id"])
+            if target_rc != 0:
+                rc = target_rc
+                break
+        if rc != 0:
+            break
+
+    emit_event(
+        "run.completed",
+        run_id=base_meta.get("run_id"),
+        meta=base_meta,
+        data={"command": "loop", "return_code": rc, "dry_run": args.dry_run, "events": str(events_path())},
+    )
+    print(f"run_id: {base_meta['run_id']}")
+    print(f"loop_id: {base_meta['loop_id']}")
+    print(f"events: {events_path()}")
+    print(f"status: {'ok' if rc == 0 else 'failed'}")
     return rc
 
 
 def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "bridge":
         return bridge(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "loop":
+        return loop(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "trace":
+        return trace_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "findings":
+        return findings_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "verdicts":
+        return verdicts_cmd(argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
+    print("       agent code loop [options]", file=sys.stderr)
+    print("       agent code trace [options]", file=sys.stderr)
+    print("       agent code findings <create|list|read> [options]", file=sys.stderr)
+    print("       agent code verdicts <record|list> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2
 
 
 def main_entry() -> None:
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (BridgeError, ValueError) as exc:
+        print(f"agent: {exc}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except BridgeError as exc:
-        print(f"agent code bridge: {exc}", file=sys.stderr)
+    except (BridgeError, ValueError) as exc:
+        print(f"agent: {exc}", file=sys.stderr)
         raise SystemExit(2)

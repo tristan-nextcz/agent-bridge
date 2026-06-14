@@ -36,7 +36,71 @@ class MailboxMcpTests(unittest.TestCase):
         rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
         self.assertEqual(rows[0]["result"]["serverInfo"]["name"], "agent-mailbox")
         tool_names = {tool["name"] for tool in rows[1]["result"]["tools"]}
-        self.assertEqual(tool_names, {"mailbox_send", "mailbox_inbox", "mailbox_read"})
+        self.assertTrue(
+            {
+                "mailbox_send",
+                "mailbox_inbox",
+                "mailbox_read",
+                "trace_events",
+                "finding_emit",
+                "findings_list",
+                "finding_read",
+                "verdict_record",
+                "verdicts_list",
+            }.issubset(tool_names)
+        )
+
+    def test_mailbox_send_and_inbox_filter_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": tmp}
+            payload = "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "mailbox_send",
+                                "arguments": {
+                                    "from": "codex",
+                                    "to": "claude",
+                                    "subject": "smoke",
+                                    "body": "hello",
+                                    "run_id": "run-mcp",
+                                    "loop_id": "loop-mcp",
+                                    "role": "builder",
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "mailbox_inbox",
+                                "arguments": {"to": "claude", "run_id": "run-mcp"},
+                            },
+                        }
+                    ),
+                    "",
+                ]
+            )
+            proc = subprocess.run(
+                ["python3", str(MCP)],
+                input=payload,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        self.assertIn("sent m0001", rows[0]["result"]["content"][0]["text"])
+        self.assertIn("run=run-mcp", rows[1]["result"]["content"][0]["text"])
 
 
 if __name__ == "__main__":
