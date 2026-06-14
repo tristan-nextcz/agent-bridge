@@ -52,6 +52,24 @@ The mailbox tools are:
 - `verdict_record`
 - `verdicts_list`
 
+## Configure Session Hooks
+
+Install lightweight SessionStart hooks for both Codex and Claude:
+
+```bash
+agent code hooks install --client both
+```
+
+The hook injects a short reminder that Agent Bridge is available, points agents at the global
+mailbox MCP path, and notes that `agent code loop` uses the auto dispatch gate. It does not spawn
+agents, run network calls, or mutate project files during session startup.
+
+Check hook status:
+
+```bash
+agent code hooks status --client both
+```
+
 ## Use
 
 From any git worktree:
