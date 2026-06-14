@@ -75,6 +75,8 @@ class BridgeCliTests(unittest.TestCase):
                     "claude",
                     "--max-turns",
                     "1",
+                    "--spawn-policy",
+                    "full",
                     "--prompt",
                     "loop smoke",
                     "--dry-run",
@@ -91,12 +93,93 @@ class BridgeCliTests(unittest.TestCase):
             self.assertEqual(proc.stdout.count("[dry-run] claude:"), 3)
             self.assertIn("run_id:", proc.stdout)
             rows = [line for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), 9)
         self.assertIn('"type": "run.created"', rows[0])
-        self.assertIn('"role": "builder"', rows[1])
-        self.assertIn('"role": "critic"', rows[3])
-        self.assertIn('"role": "verifier"', rows[5])
+        self.assertIn('"type": "dispatch.policy_evaluated"', rows[1])
+        self.assertIn('"role": "builder"', rows[2])
+        self.assertIn('"role": "critic"', rows[4])
+        self.assertIn('"role": "verifier"', rows[6])
         self.assertIn('"type": "run.completed"', rows[-1])
+
+    def test_loop_auto_uses_one_adversarial_agent_for_vague_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "loop",
+                    "--builder",
+                    "claude",
+                    "--critic",
+                    "claude",
+                    "--verifier",
+                    "claude",
+                    "--max-turns",
+                    "3",
+                    "--prompt",
+                    "quick check this",
+                    "--dry-run",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "state" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("[dry-run] claude:"), 1)
+        self.assertIn("dispatch_decision: adversarial_only", proc.stdout)
+        dispatched = [row for row in rows if row["type"] == "agent.dispatched"]
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["role"], "adversarial")
+        self.assertEqual(dispatched[0]["data"]["target"], "claude")
+
+    def test_loop_auto_allows_full_loop_for_scoped_implementation(self) -> None:
+        prompt = (
+            "Implement a schema and trace controller update in agent_bridge/cli.py "
+            "and tests/test_bridge_cli.py with backwards compatible workflow coverage "
+            "and adversarial validation."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state")}
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "loop",
+                    "--builder",
+                    "claude",
+                    "--critic",
+                    "claude",
+                    "--verifier",
+                    "claude",
+                    "--prompt",
+                    prompt,
+                    "--dry-run",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "state" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("[dry-run] claude:"), 3)
+        self.assertIn("dispatch_decision: full_loop", proc.stdout)
+        self.assertEqual([row["role"] for row in rows if row["type"] == "agent.dispatched"], ["builder", "critic", "verifier"])
 
     def test_codex_dry_run_uses_current_exec_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

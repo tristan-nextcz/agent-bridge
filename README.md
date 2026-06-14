@@ -92,6 +92,13 @@ agent code loop --builder codex --critic claude --verifier claude --max-turns 1 
   --prompt "Implement the scoped change and look for blocking defects."
 ```
 
+By default, `agent code loop` uses `--spawn-policy auto`. The bridge scores the prompt for
+implementation depth, concrete scope, and risk signals before spending on the full
+builder/critic/verifier loop. If the request is vague, review-only, or too shallow to justify a
+full spawn, it dispatches one analysis-only adversarial agent instead. Use
+`--spawn-policy full` to force the full loop, or `--spawn-policy adversarial-only` to always run
+the single-review fallback.
+
 Inspect trace events and structured findings:
 
 ```bash

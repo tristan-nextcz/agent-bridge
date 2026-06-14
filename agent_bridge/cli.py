@@ -13,6 +13,7 @@ the caller is Codex or Claude.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,13 @@ PROJECT_DIR = Path.cwd()
 
 class BridgeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SpawnDecision:
+    mode: str
+    score: int
+    reasons: list[str]
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -187,6 +195,101 @@ def read_prompt(args: argparse.Namespace) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
     return ""
+
+
+IMPLEMENTATION_TERMS = {
+    "add",
+    "build",
+    "change",
+    "create",
+    "fix",
+    "implement",
+    "refactor",
+    "update",
+}
+COMPLEXITY_TERMS = {
+    "api",
+    "backwards compatible",
+    "compatibility",
+    "concurrency",
+    "controller",
+    "migration",
+    "schema",
+    "security",
+    "trace",
+    "workflow",
+}
+REVIEW_ONLY_TERMS = {
+    "assess",
+    "audit",
+    "check",
+    "inspect",
+    "review",
+    "smoke",
+    "summarize",
+}
+VAGUE_TERMS = {
+    "quick",
+    "basic",
+    "maybe",
+    "thing",
+    "this",
+    "unclear",
+}
+FILE_SUFFIXES = (".py", ".js", ".ts", ".tsx", ".json", ".md", ".toml", ".yaml", ".yml", ".sh")
+
+
+def _contains_any(text: str, terms: set[str], words: set[str]) -> bool:
+    return any((term in text if " " in term else term in words) for term in terms)
+
+
+def assess_spawn_decision(prompt: str, *, policy: str, max_turns: int) -> SpawnDecision:
+    if policy == "full":
+        return SpawnDecision("full_loop", 999, ["forced full loop by --spawn-policy full"])
+    if policy == "adversarial-only":
+        return SpawnDecision("adversarial_only", 0, ["forced single adversarial review by --spawn-policy adversarial-only"])
+
+    text = " ".join(prompt.lower().split())
+    words = text.split()
+    word_set = {word.strip("`'\"(),:;.") for word in words}
+    score = 0
+    reasons: list[str] = []
+
+    has_impl = _contains_any(text, IMPLEMENTATION_TERMS, word_set)
+    has_review_only = _contains_any(text, REVIEW_ONLY_TERMS, word_set) and not has_impl
+    has_path = any(token.strip("`'\"(),:;").endswith(FILE_SUFFIXES) or "/" in token for token in words)
+
+    if has_impl:
+        score += 2
+        reasons.append("implementation verb present")
+    if len(words) >= 35:
+        score += 1
+        reasons.append("prompt has enough detail")
+    if has_path:
+        score += 1
+        reasons.append("concrete file or path scope present")
+    if _contains_any(text, COMPLEXITY_TERMS, word_set):
+        score += 1
+        reasons.append("complexity/risk signal present")
+    if max_turns > 1:
+        score += 1
+        reasons.append("caller requested multiple turns")
+    if "adversarial" in text or "red team" in text:
+        score += 1
+        reasons.append("adversarial validation requested")
+
+    if has_review_only:
+        score -= 2
+        reasons.append("review-only request")
+    if len(words) < 12 or _contains_any(text, VAGUE_TERMS, word_set):
+        score -= 1
+        reasons.append("prompt is short or vague")
+
+    if has_impl and score >= 4:
+        return SpawnDecision("full_loop", score, reasons)
+    if not reasons:
+        reasons.append("insufficient shape/depth signals")
+    return SpawnDecision("adversarial_only", score, reasons)
 
 
 def build_scope(source: str, target: dict[str, Any], mode: str, meta: dict[str, Any] | None = None) -> str:
@@ -559,18 +662,35 @@ def parse_loop_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--verifier", default="claude", help="Agent id for final verification turns")
     parser.add_argument("--max-turns", type=int, default=1)
     parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    parser.add_argument(
+        "--spawn-policy",
+        choices=["auto", "full", "adversarial-only"],
+        default=os.environ.get("AGENT_BRIDGE_SPAWN_POLICY", "auto"),
+        help="Dispatch policy. auto gates full loops; adversarial-only dispatches one review agent.",
+    )
     parser.add_argument("--prompt", help="Loop task prompt. If omitted in non-interactive mode, stdin is used.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned dispatches without invoking agents")
     add_meta_args(parser)
     return parser.parse_args(argv)
 
 
-def _loop_prompt(*, role: str, attempt: int, original_prompt: str, run_id: str, loop_id: str) -> str:
+def _loop_prompt(
+    *,
+    role: str,
+    attempt: int,
+    original_prompt: str,
+    run_id: str,
+    loop_id: str,
+    decision: SpawnDecision,
+) -> str:
     return f"""[ADVERSARIAL LOOP]
 Run: {run_id}
 Loop: {loop_id}
 Role: {role}
 Attempt: {attempt}
+Dispatch decision: {decision.mode}
+Decision score: {decision.score}
+Decision reasons: {'; '.join(decision.reasons)}
 
 Original task:
 {original_prompt}
@@ -579,6 +699,7 @@ Role contract:
 - builder: implement the requested change and run focused tests.
 - critic: inspect the current worktree for concrete defects and emit structured findings when available.
 - verifier: smoke test the current worktree and record whether blocking issues remain.
+- adversarial: when full-loop criteria are not met, do one analysis-only adversarial review and say whether a larger spawn is justified.
 
 Report files changed, checks run, and any blocking findings or verdicts.
 """
@@ -599,6 +720,7 @@ def loop(argv: list[str]) -> int:
     original_prompt = read_prompt(args)
     if not original_prompt:
         raise BridgeError("a loop task prompt is required")
+    decision = assess_spawn_decision(original_prompt, policy=args.spawn_policy, max_turns=args.max_turns)
 
     base_meta = ensure_run_meta(extract_meta(args))
     base_meta.setdefault("loop_id", base_meta.get("run_id", "run").replace("run_", "loop_", 1))
@@ -613,18 +735,38 @@ def loop(argv: list[str]) -> int:
             "critic": args.critic,
             "verifier": args.verifier,
             "max_turns": args.max_turns,
+            "spawn_policy": args.spawn_policy,
+            "dispatch_decision": decision.mode,
+            "decision_score": decision.score,
+            "decision_reasons": decision.reasons,
             "dry_run": args.dry_run,
+        },
+    )
+    emit_event(
+        "dispatch.policy_evaluated",
+        run_id=base_meta.get("run_id"),
+        meta=base_meta,
+        data={
+            "command": "loop",
+            "spawn_policy": args.spawn_policy,
+            "decision": decision.mode,
+            "score": decision.score,
+            "reasons": decision.reasons,
         },
     )
 
     rc = 0
     parent_id = base_meta.get("parent_id")
-    for attempt in range(1, args.max_turns + 1):
-        phases = [
-            ("builder", args.builder, "code"),
-            ("critic", args.critic, "review"),
-            ("verifier", args.verifier, "review"),
-        ]
+    turn_count = args.max_turns if decision.mode == "full_loop" else 1
+    for attempt in range(1, turn_count + 1):
+        if decision.mode == "full_loop":
+            phases = [
+                ("builder", args.builder, "code"),
+                ("critic", args.critic, "review"),
+                ("verifier", args.verifier, "review"),
+            ]
+        else:
+            phases = [("adversarial", args.critic, "review")]
         for role, target_id, mode in phases:
             turn_meta = child_turn_meta(base_meta, role=role, attempt=attempt, parent_id=parent_id)
             prompt = _loop_prompt(
@@ -633,6 +775,7 @@ def loop(argv: list[str]) -> int:
                 original_prompt=original_prompt,
                 run_id=str(turn_meta["run_id"]),
                 loop_id=str(turn_meta["loop_id"]),
+                decision=decision,
             )
             target_rc = invoke_target(
                 agents[target_id],
@@ -658,6 +801,8 @@ def loop(argv: list[str]) -> int:
     )
     print(f"run_id: {base_meta['run_id']}")
     print(f"loop_id: {base_meta['loop_id']}")
+    print(f"dispatch_decision: {decision.mode}")
+    print(f"decision_score: {decision.score}")
     print(f"events: {events_path()}")
     print(f"status: {'ok' if rc == 0 else 'failed'}")
     return rc
