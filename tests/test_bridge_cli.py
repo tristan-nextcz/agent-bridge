@@ -272,6 +272,7 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(output["hookEventName"], "SessionStart")
         self.assertIn("Agent Bridge session bootstrap", output["additionalContext"])
         self.assertIn("never spawns agents", output["additionalContext"])
+        self.assertIn(str(ROOT / "agent_bridge" / "mailbox_mcp.py"), output["additionalContext"])
 
     def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,6 +310,32 @@ class BridgeCliTests(unittest.TestCase):
             1,
         )
         self.assertEqual(claude["model"], "opus")
+
+    def test_hooks_install_uses_windows_cmd_wrapper_for_cmd_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "HOME": tmp,
+                "AGENT_BRIDGE_HOOK_AGENT": r"C:\Users\me\.local\bin\agent.cmd",
+            }
+            codex_dir = Path(tmp) / ".codex"
+            codex_dir.mkdir()
+            proc = subprocess.run(
+                [str(AGENT), "code", "hooks", "install", "--client", "codex"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            codex = json.loads((codex_dir / "hooks.json").read_text(encoding="utf-8"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        hook = codex["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(
+            hook["command"],
+            r'cmd /d /c ""C:\Users\me\.local\bin\agent.cmd" code hook session-start --client codex"',
+        )
 
 
 if __name__ == "__main__":
