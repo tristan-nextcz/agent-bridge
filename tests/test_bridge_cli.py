@@ -257,6 +257,59 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(dispatched["parent_id"], "parent-turn")
         self.assertNotEqual(dispatched["turn_id"], "caller-turn")
 
+    def test_session_start_hook_outputs_context_json(self) -> None:
+        proc = subprocess.run(
+            [str(AGENT), "code", "hook", "session-start", "--client", "codex"],
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        output = payload["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "SessionStart")
+        self.assertIn("Agent Bridge session bootstrap", output["additionalContext"])
+        self.assertIn("never spawns agents", output["additionalContext"])
+
+    def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "HOME": tmp, "AGENT_BRIDGE_HOOK_AGENT": "/tmp/agent"}
+            codex_dir = Path(tmp) / ".codex"
+            claude_dir = Path(tmp) / ".claude"
+            codex_dir.mkdir()
+            claude_dir.mkdir()
+            (codex_dir / "hooks.json").write_text('{"hooks":{"SessionStart":[]}}\n', encoding="utf-8")
+            (claude_dir / "settings.json").write_text('{"model":"opus","hooks":{}}\n', encoding="utf-8")
+
+            for _ in range(2):
+                proc = subprocess.run(
+                    [str(AGENT), "code", "hooks", "install", "--client", "both"],
+                    cwd=str(ROOT),
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            codex = json.loads((codex_dir / "hooks.json").read_text(encoding="utf-8"))
+            claude = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+
+        codex_hooks = codex["hooks"]["SessionStart"][0]["hooks"]
+        claude_hooks = claude["hooks"]["SessionStart"][0]["hooks"]
+        self.assertEqual(
+            [hook["command"] for hook in codex_hooks].count("'/tmp/agent' code hook session-start --client codex"),
+            1,
+        )
+        self.assertEqual(
+            [hook["command"] for hook in claude_hooks].count("'/tmp/agent' code hook session-start --client claude"),
+            1,
+        )
+        self.assertEqual(claude["model"], "opus")
+
 
 if __name__ == "__main__":
     unittest.main()

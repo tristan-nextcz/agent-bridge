@@ -550,6 +550,152 @@ def _comma_values(values: list[str] | None) -> list[str]:
     return out
 
 
+def _hook_agent_command(client: str) -> str:
+    agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", "/Users/tts/.local/bin/agent")
+    return f"'{agent_bin}' code hook session-start --client {client}"
+
+
+def session_start_context(client: str) -> str:
+    cwd = os.environ.get("PWD") or str(Path.cwd())
+    git_root = ""
+    try:
+        git_root = subprocess.check_output(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    location = f" Current git root: {git_root}." if git_root else ""
+    return (
+        "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
+        "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
+        "`agent code loop` for adversarial loops; loop dispatch defaults to `--spawn-policy auto`, "
+        "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
+        "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
+        "`/Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py`. This startup hook only injects "
+        f"context and never spawns agents. Client: {client}.{location}"
+    )
+
+
+def hook_session_start(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code hook session-start", description="Emit SessionStart hook context.")
+    parser.add_argument("--client", choices=["codex", "claude"], required=True)
+    parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
+    args = parser.parse_args(argv)
+    context = session_start_context(args.client)
+    if args.plain:
+        print(context)
+    else:
+        _json_print({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}})
+    return 0
+
+
+def _load_json_config(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return default
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise BridgeError(f"{path} must contain a JSON object")
+    return data
+
+
+def _write_json_config(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_name(f"{path.name}.bak-{utc_stamp()}")
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _session_start_entries(config: dict[str, Any]) -> list[dict[str, Any]]:
+    hooks = config.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise BridgeError("hooks must be a JSON object")
+    entries = hooks.setdefault("SessionStart", [])
+    if not isinstance(entries, list):
+        raise BridgeError("hooks.SessionStart must be a list")
+    return entries
+
+
+def _ensure_command_hook(config: dict[str, Any], command: str) -> bool:
+    entries = _session_start_entries(config)
+    target_entry = None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("matcher") == "startup|resume" and isinstance(entry.get("hooks"), list):
+            target_entry = entry
+            break
+    if target_entry is None:
+        target_entry = {"matcher": "startup|resume", "hooks": []}
+        entries.append(target_entry)
+    hooks = target_entry["hooks"]
+    for hook in hooks:
+        if isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == command:
+            return False
+    hooks.append({"type": "command", "command": command})
+    return True
+
+
+def _config_path(client: str) -> Path:
+    home = Path.home()
+    if client == "codex":
+        return home / ".codex" / "hooks.json"
+    if client == "claude":
+        return home / ".claude" / "settings.json"
+    raise BridgeError(f"unsupported hook client {client!r}")
+
+
+def install_session_hook(client: str) -> bool:
+    path = _config_path(client)
+    default = {"hooks": {}} if client == "codex" else {}
+    config = _load_json_config(path, default)
+    changed = _ensure_command_hook(config, _hook_agent_command(client))
+    if changed:
+        _write_json_config(path, config)
+    return changed
+
+
+def session_hook_installed(client: str) -> bool:
+    path = _config_path(client)
+    if not path.exists():
+        return False
+    config = _load_json_config(path, {})
+    command = _hook_agent_command(client)
+    for entry in config.get("hooks", {}).get("SessionStart", []):
+        for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == command:
+                return True
+    return False
+
+
+def hooks_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code hooks", description="Install or inspect Agent Bridge session hooks.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    install = sub.add_parser("install")
+    install.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    status = sub.add_parser("status")
+    status.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    args = parser.parse_args(argv)
+
+    clients = ["codex", "claude"] if args.client == "both" else [args.client]
+    if args.cmd == "install":
+        for client in clients:
+            changed = install_session_hook(client)
+            verb = "installed" if changed else "already installed"
+            print(f"{client}: {verb} ({_config_path(client)})")
+        return 0
+    for client in clients:
+        installed = session_hook_installed(client)
+        print(f"{client}: {'installed' if installed else 'not installed'} ({_config_path(client)})")
+    return 0
+
+
 def trace_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code trace", description="Inspect agent bridge trace events.")
     parser.add_argument("--run-id")
@@ -819,6 +965,10 @@ def main(argv: list[str]) -> int:
         return findings_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "verdicts":
         return verdicts_cmd(argv[2:])
+    if len(argv) >= 3 and argv[0] == "code" and argv[1] == "hook" and argv[2] == "session-start":
+        return hook_session_start(argv[3:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":
+        return hooks_cmd(argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
@@ -826,6 +976,8 @@ def main(argv: list[str]) -> int:
     print("       agent code trace [options]", file=sys.stderr)
     print("       agent code findings <create|list|read> [options]", file=sys.stderr)
     print("       agent code verdicts <record|list> [options]", file=sys.stderr)
+    print("       agent code hook session-start [options]", file=sys.stderr)
+    print("       agent code hooks <install|status> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2
 
