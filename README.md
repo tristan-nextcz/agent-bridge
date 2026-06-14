@@ -26,6 +26,24 @@ That creates:
 
 `~/.local/bin` must be on `PATH`.
 
+On Windows PowerShell:
+
+```powershell
+git clone https://github.com/tristan-nextcz/agent-bridge.git $HOME\Code\agent-bridge
+cd $HOME\Code\agent-bridge
+.\scripts\install.ps1
+```
+
+That creates:
+
+```text
+%USERPROFILE%\.local\bin\agent.cmd
+%USERPROFILE%\.local\state\agent-bridge\
+```
+
+The installer adds `%USERPROFILE%\.local\bin` to the user `PATH` unless you pass
+`-SkipPathUpdate`. Open a new terminal after install so `agent` is available everywhere.
+
 ## Configure MCP
 
 Register the mailbox globally in Claude Code:
@@ -68,6 +86,13 @@ Check hook status:
 
 ```bash
 agent code hooks status --client both
+```
+
+On Windows, `.\scripts\install.ps1` runs the same hook installer automatically. To also attempt
+MCP registration for both local CLIs, run:
+
+```powershell
+.\scripts\install.ps1 -RegisterMcp
 ```
 
 ## Use

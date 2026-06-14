@@ -552,6 +552,8 @@ def _comma_values(values: list[str] | None) -> list[str]:
 
 def _hook_agent_command(client: str) -> str:
     agent_bin = os.environ.get("AGENT_BRIDGE_HOOK_AGENT", "/Users/tts/.local/bin/agent")
+    if agent_bin.lower().endswith((".cmd", ".bat")) or "\\" in agent_bin:
+        return f'cmd /d /c ""{agent_bin}" code hook session-start --client {client}"'
     return f"'{agent_bin}' code hook session-start --client {client}"
 
 
@@ -573,7 +575,7 @@ def session_start_context(client: str) -> str:
         "`agent code loop` for adversarial loops; loop dispatch defaults to `--spawn-policy auto`, "
         "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
-        "`/Users/tts/Code/agent-bridge/agent_bridge/mailbox_mcp.py`. This startup hook only injects "
+        f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. This startup hook only injects "
         f"context and never spawns agents. Client: {client}.{location}"
     )
 
