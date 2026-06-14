@@ -26,9 +26,15 @@ import sys
 
 try:
     from . import mailbox as mb
+    from .correlation import extract_meta
+    from .findings import create_finding, format_findings, format_verdicts, list_findings, list_verdicts, read_finding, record_verdict
+    from .trace import format_events, load_events
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mailbox as mb  # type: ignore[no-redef]
+    from correlation import extract_meta  # type: ignore[no-redef]
+    from findings import create_finding, format_findings, format_verdicts, list_findings, list_verdicts, read_finding, record_verdict  # type: ignore[no-redef]
+    from trace import format_events, load_events  # type: ignore[no-redef]
 
 PROTO = "2024-11-05"
 
@@ -45,6 +51,12 @@ TOOLS = [
                 "subject": {"type": "string"},
                 "body": {"type": "string"},
                 "ref": {"type": "string", "description": "Optional id of the message this replies to."},
+                "run_id": {"type": "string", "description": "Optional correlation: run identifier."},
+                "loop_id": {"type": "string", "description": "Optional correlation: loop identifier."},
+                "turn_id": {"type": "string", "description": "Optional correlation: turn identifier."},
+                "parent_id": {"type": "string", "description": "Optional correlation: parent id."},
+                "attempt": {"type": "integer", "description": "Optional correlation: attempt number."},
+                "role": {"type": "string", "description": "Optional correlation: sender role."},
             },
         },
     },
@@ -57,6 +69,8 @@ TOOLS = [
             "properties": {
                 "to": {"type": "string"},
                 "unread_only": {"type": "boolean"},
+                "run_id": {"type": "string", "description": "Optional filter: only this run_id."},
+                "loop_id": {"type": "string", "description": "Optional filter: only this loop_id."},
             },
         },
     },
@@ -71,64 +85,176 @@ TOOLS = [
     },
 ]
 
-
-def _append(msg):
-    os.makedirs(os.path.dirname(mb.MAILBOX), exist_ok=True)
-    with open(mb.MAILBOX, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(msg) + "\n")
-
-
-def _rewrite(msgs):
-    os.makedirs(os.path.dirname(mb.MAILBOX), exist_ok=True)
-    tmp = mb.MAILBOX + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for m in msgs:
-            fh.write(json.dumps(m) + "\n")
-    os.replace(tmp, mb.MAILBOX)  # atomic
+TOOLS.extend([
+    {
+        "name": "trace_events",
+        "description": "List structured trace events, optionally filtered by run_id or type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "type": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "finding_emit",
+        "description": "Emit a structured adversarial finding.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id", "severity", "claim"],
+            "properties": {
+                "run_id": {"type": "string"},
+                "severity": {"type": "string"},
+                "claim": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+                "reproduction": {"type": "string"},
+                "status": {"type": "string"},
+                "owner_role": {"type": "string"},
+                "rebuttal": {"type": "string"},
+                "resolution": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "findings_list",
+        "description": "List structured findings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "status": {"type": "string"},
+                "severity": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "finding_read",
+        "description": "Read a structured finding by id.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "string"}},
+        },
+    },
+    {
+        "name": "verdict_record",
+        "description": "Record an adversarial loop verdict.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["run_id", "status", "summary"],
+            "properties": {
+                "run_id": {"type": "string"},
+                "status": {"type": "string"},
+                "summary": {"type": "string"},
+                "blocking_findings": {"type": "array", "items": {"type": "string"}},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "verdicts_list",
+        "description": "List recorded verdicts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "status": {"type": "string"},
+            },
+        },
+    },
+])
 
 
 def _send(args):
-    msgs = mb._load()
-    m = {
-        "id": f"m{len(msgs) + 1:04d}",
-        "ts": mb._now(),
-        "from": args["from"],
-        "to": args["to"],
-        "subject": args["subject"],
-        "body": args["body"],
-        "status": "unread",
-    }
-    if args.get("ref"):
-        m["ref"] = args["ref"]
-    _append(m)
-    return f'sent {m["id"]}'
+    msg = mb.send_message(
+        frm=args["from"],
+        to=args["to"],
+        subject=args["subject"],
+        body=args["body"],
+        ref=args.get("ref"),
+        meta=extract_meta(args),
+        status="unread",
+    )
+    return f'sent {msg["id"]}'
 
 
 def _inbox(args):
-    to = args["to"]
-    uo = args.get("unread_only", False)
-    rows = [
-        f'{m["id"]} [{m.get("status", "unread")}] {m["ts"]} from {m["from"]}: {m["subject"]}'
-        for m in mb._load()
-        if m["to"] == to and (not uo or m.get("status", "unread") != "read")
-    ]
+    rows = []
+    msgs = mb.filter_messages(
+        to=args["to"],
+        unread_only=args.get("unread_only", False),
+        run_id=args.get("run_id"),
+        loop_id=args.get("loop_id"),
+    )
+    for m in msgs:
+        meta = m.get("meta") or {}
+        suffix = f' run={meta["run_id"]}' if meta.get("run_id") else ""
+        rows.append(f'{m["id"]} [{m.get("status", "unread")}] {m["ts"]} from {m["from"]}: {m["subject"]}{suffix}')
     return "\n".join(rows) if rows else "(empty)"
 
 
 def _read(args):
-    msgs = mb._load()
-    found = None
-    for m in msgs:
-        if m["id"] == args["id"]:
-            found = m
-            m["status"] = "read"
+    found = mb.mark_read(args["id"])
     if found is not None:
-        _rewrite(msgs)
         return json.dumps(found, indent=2)
     return f'no message {args["id"]}'
 
 
-DISPATCH = {"mailbox_send": _send, "mailbox_inbox": _inbox, "mailbox_read": _read}
+def _trace_events(args):
+    return format_events(load_events(run_id=args.get("run_id"), event_type=args.get("type")))
+
+
+def _finding_emit(args):
+    row = create_finding(
+        run_id=args["run_id"],
+        severity=args["severity"],
+        claim=args["claim"],
+        evidence=args.get("evidence"),
+        reproduction=args.get("reproduction", ""),
+        status=args.get("status", "open"),
+        owner_role=args.get("owner_role", ""),
+        rebuttal=args.get("rebuttal", ""),
+        resolution=args.get("resolution", ""),
+    )
+    return json.dumps(row, indent=2)
+
+
+def _findings_list(args):
+    return format_findings(list_findings(run_id=args.get("run_id"), status=args.get("status"), severity=args.get("severity")))
+
+
+def _finding_read(args):
+    row = read_finding(args["id"])
+    return json.dumps(row, indent=2) if row else f'no finding {args["id"]}'
+
+
+def _verdict_record(args):
+    row = record_verdict(
+        run_id=args["run_id"],
+        status=args["status"],
+        summary=args["summary"],
+        blocking_findings=args.get("blocking_findings"),
+        evidence=args.get("evidence"),
+    )
+    return json.dumps(row, indent=2)
+
+
+def _verdicts_list(args):
+    return format_verdicts(list_verdicts(run_id=args.get("run_id"), status=args.get("status")))
+
+
+DISPATCH = {
+    "mailbox_send": _send,
+    "mailbox_inbox": _inbox,
+    "mailbox_read": _read,
+    "trace_events": _trace_events,
+    "finding_emit": _finding_emit,
+    "findings_list": _findings_list,
+    "finding_read": _finding_read,
+    "verdict_record": _verdict_record,
+    "verdicts_list": _verdicts_list,
+}
 
 
 def reply(id_, result=None, error=None):
