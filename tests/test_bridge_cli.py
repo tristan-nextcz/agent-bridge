@@ -257,6 +257,73 @@ class BridgeCliTests(unittest.TestCase):
         self.assertEqual(dispatched["parent_id"], "parent-turn")
         self.assertNotEqual(dispatched["turn_id"], "caller-turn")
 
+    def test_bridge_writes_correlation_to_transcript_header_and_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agents.json"
+            state = Path(tmp) / "state"
+            config.write_text(
+                json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "id": "helper",
+                                "label": "Helper",
+                                "adapter": "argv",
+                                "command": "python3",
+                                "args": ["-c", "print('agent output')"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "AGENT_BRIDGE_STATE_DIR": str(state)}
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--config",
+                    str(config),
+                    "--from",
+                    "human",
+                    "--to",
+                    "helper",
+                    "--mode",
+                    "review",
+                    "--prompt",
+                    "transcript smoke",
+                    "--run-id",
+                    "run.transcript",
+                    "--loop-id",
+                    "loop.transcript",
+                    "--parent-id",
+                    "parent-transcript",
+                    "--attempt",
+                    "3",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            transcripts = list((state / "transcripts").glob("*.txt"))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(len(transcripts), 1)
+            transcript_name = transcripts[0].name
+            text = transcripts[0].read_text(encoding="utf-8")
+        self.assertIn("run_transcript_", transcript_name)
+        self.assertIn("_helper_", transcript_name)
+        self.assertIn("correlation: ", text)
+        self.assertIn("run_id=run.transcript", text)
+        self.assertIn("loop_id=loop.transcript", text)
+        self.assertIn("parent_id=parent-transcript", text)
+        self.assertIn("attempt=3", text)
+        self.assertIn("role=helper", text)
+        self.assertRegex(text, r"turn_id=turn_helper_")
+
     def test_session_start_hook_outputs_context_json(self) -> None:
         proc = subprocess.run(
             [str(AGENT), "code", "hook", "session-start", "--client", "codex"],
