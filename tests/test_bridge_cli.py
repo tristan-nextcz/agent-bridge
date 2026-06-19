@@ -57,7 +57,8 @@ class BridgeCliTests(unittest.TestCase):
             expected_project = repo.resolve()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"Project: {expected_project}", proc.stdout)
-        self.assertIn("--permission-mode plan", proc.stdout)
+        self.assertIn("--permission-mode auto", proc.stdout)
+        self.assertIn("--allowedTools Read,Grep,Glob", proc.stdout)
 
     def test_loop_dry_run_emits_ordered_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,21 +259,95 @@ class BridgeCliTests(unittest.TestCase):
         self.assertNotEqual(dispatched["turn_id"], "caller-turn")
 
     def test_session_start_hook_outputs_context_json(self) -> None:
-        proc = subprocess.run(
-            [str(AGENT), "code", "hook", "session-start", "--client", "codex"],
-            cwd=str(ROOT),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        payload = json.loads(proc.stdout)
-        output = payload["hookSpecificOutput"]
-        self.assertEqual(output["hookEventName"], "SessionStart")
-        self.assertIn("Agent Bridge session bootstrap", output["additionalContext"])
-        self.assertIn("never spawns agents", output["additionalContext"])
-        self.assertIn(str(ROOT / "agent_bridge" / "mailbox_mcp.py"), output["additionalContext"])
+        with tempfile.TemporaryDirectory() as tmp:
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            (shared_root / "Agent-Bridge").mkdir(parents=True)
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root),
+                "AGENT_BRIDGE_MACHINE_ID": "test-machine",
+            }
+            proc = subprocess.run(
+                [str(AGENT), "code", "hook", "session-start", "--client", "codex"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            registry_file = shared_root / "Agent-Bridge" / "registry" / "test-machine.codex.json"
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            payload = json.loads(proc.stdout)
+            output = payload["hookSpecificOutput"]
+            self.assertEqual(output["hookEventName"], "SessionStart")
+            self.assertIn("Agent Bridge session bootstrap", output["additionalContext"])
+            self.assertIn("never spawns agents", output["additionalContext"])
+            self.assertIn("agent code harness status", output["additionalContext"])
+            self.assertIn(str(registry_file), output["additionalContext"])
+            self.assertIn(str(ROOT / "agent_bridge" / "mailbox_mcp.py"), output["additionalContext"])
+            self.assertTrue(registry_file.exists())
+
+    def test_harness_register_and_status_use_shared_agent_skills_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_MACHINE_ID": "test-machine",
+                "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root),
+            }
+            register = subprocess.run(
+                [str(AGENT), "code", "harness", "register", "--client", "codex"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            status = subprocess.run(
+                [str(AGENT), "code", "harness", "status", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(register.returncode, 0, register.stderr)
+            self.assertIn("test-machine.codex.json", register.stdout)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            payload = json.loads(status.stdout)
+            self.assertEqual(len(payload["harnesses"]), 1)
+            self.assertEqual(payload["harnesses"][0]["client"], "codex")
+            self.assertTrue(payload["harnesses"][0]["fresh"])
+
+    def test_harness_install_skill_writes_skill_and_local_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            shared_root = Path(tmp) / "SharedAgentSkills"
+            env = {**os.environ, "HOME": str(home), "AGENT_BRIDGE_SHARED_SKILLS_ROOT": str(shared_root)}
+            proc = subprocess.run(
+                [str(AGENT), "code", "harness", "install-skill", "--json"],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            skill = shared_root / "Agent-Bridge" / "SKILL.md"
+            codex_link = home / ".codex" / "skills" / "agent-bridge"
+            claude_link = home / ".claude" / "skills" / "agent-bridge"
+            agents_link = home / ".agents" / "skills" / "agent-bridge"
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["skill_path"], str(skill))
+            self.assertTrue(skill.exists())
+            self.assertIn("name: agent-bridge", skill.read_text(encoding="utf-8"))
+            self.assertEqual(codex_link.resolve(), (shared_root / "Agent-Bridge").resolve())
+            self.assertEqual(claude_link.resolve(), (shared_root / "Agent-Bridge").resolve())
+            self.assertEqual(agents_link.resolve(), (shared_root / "Agent-Bridge").resolve())
 
     def test_hooks_install_is_idempotent_for_codex_and_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
