@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import datetime as dt
+import getpass
 import json
 import os
 from pathlib import Path
+import platform
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from typing import Any
 
-from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, safe_fragment, utc_stamp
+from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
     create_finding,
     format_findings,
@@ -34,6 +38,16 @@ from .findings import (
     record_verdict,
 )
 from .trace import emit_event, events_path, format_events, load_events
+from .workflow import (
+    WorkflowError,
+    format_inspection,
+    format_report,
+    inspect_workflow_run,
+    list_workflows,
+    load_workflow,
+    plan_workflow_run,
+    run_workflow,
+)
 
 
 BRIDGE_DIR = Path(__file__).resolve().parent
@@ -42,6 +56,9 @@ STATE_DIR = Path(os.environ.get("AGENT_BRIDGE_STATE_DIR", Path.home() / ".local/
 TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 BRIDGE_LOG = STATE_DIR / "bridge_agents.log"
 PROJECT_DIR = Path.cwd()
+SHARED_BRIDGE_DIR_NAME = "Agent-Bridge"
+SHARED_REGISTRY_DIR_NAME = "registry"
+SHARED_SKILL_LINK_NAME = "agent-bridge"
 
 
 class BridgeError(RuntimeError):
@@ -336,8 +353,8 @@ def command_for_agent(
     command = resolve_command(agent)
     adapter = agent.get("adapter")
     if adapter == "claude_code":
-        permission_mode = "acceptEdits" if mode == "code" else "plan"
-        return [
+        permission_mode = "acceptEdits" if mode == "code" else "auto"
+        cmd = [
             command,
             "-p",
             prompt,
@@ -352,6 +369,9 @@ def command_for_agent(
             "--output-format",
             "text",
         ]
+        if mode == "review":
+            cmd.extend(["--allowedTools", "Read,Grep,Glob"])
+        return cmd
     if adapter == "codex_exec":
         sandbox = "workspace-write" if mode == "code" else "read-only"
         combined_prompt = f"{scope}\n\n[BRIDGE REQUEST FROM {source}]\n{prompt}"
@@ -557,26 +577,344 @@ def _hook_agent_command(client: str) -> str:
     return f"'{agent_bin}' code hook session-start --client {client}"
 
 
-def session_start_context(client: str) -> str:
-    cwd = os.environ.get("PWD") or str(Path.cwd())
-    git_root = ""
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        key = str(path.expanduser())
+        if key not in seen:
+            seen.add(key)
+            out.append(path.expanduser())
+    return out
+
+
+def _env_path_candidates(*names: str) -> list[Path]:
+    paths: list[Path] = []
+    for name in names:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        for part in value.split(os.pathsep):
+            if part.strip():
+                paths.append(Path(part.strip()))
+    return paths
+
+
+def shared_skills_root_candidates() -> list[Path]:
+    home = Path.home()
+    candidates = _env_path_candidates(
+        "AGENT_BRIDGE_SHARED_SKILLS_ROOT",
+        "SHARED_AGENT_SKILLS_ROOT",
+        "CAREER_SHARED_SKILLS_ROOT",
+    )
+    for name in ("OneDriveCommercial", "OneDriveConsumer", "OneDrive"):
+        value = os.environ.get(name)
+        if value:
+            candidates.append(Path(value) / "SharedAgentSkills")
+    candidates.extend(
+        [
+            home / "Library" / "CloudStorage" / "OneDrive-nextcz.com" / "SharedAgentSkills",
+            home / "Library" / "CloudStorage" / "OneDrive-Personal" / "SharedAgentSkills",
+            home / "OneDrive - Next Cz" / "SharedAgentSkills",
+            home / "OneDrive" / "SharedAgentSkills",
+        ]
+    )
+    return _dedupe_paths(candidates)
+
+
+def resolve_shared_skills_root(
+    root: str | None = None,
+    *,
+    create: bool = False,
+    required: bool = True,
+    require_bridge_dir: bool = False,
+) -> Path | None:
+    if root:
+        resolved = Path(root).expanduser()
+        if create:
+            resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    env_candidates = _env_path_candidates(
+        "AGENT_BRIDGE_SHARED_SKILLS_ROOT",
+        "SHARED_AGENT_SKILLS_ROOT",
+        "CAREER_SHARED_SKILLS_ROOT",
+    )
+    if create and env_candidates:
+        env_candidates[0].mkdir(parents=True, exist_ok=True)
+        return env_candidates[0]
+
+    candidates = shared_skills_root_candidates()
+    for candidate in candidates:
+        if (candidate / SHARED_BRIDGE_DIR_NAME).exists():
+            return candidate
+    if not require_bridge_dir:
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    if create and candidates:
+        candidates[0].mkdir(parents=True, exist_ok=True)
+        return candidates[0]
+    if required:
+        searched = ", ".join(str(path) for path in candidates)
+        raise BridgeError(f"could not find a shared AgentSkills root; searched: {searched}")
+    return None
+
+
+def shared_bridge_dir(root: str | None = None, *, create: bool = False, required: bool = True) -> Path | None:
+    skills_root = resolve_shared_skills_root(root, create=create, required=required, require_bridge_dir=not create)
+    if skills_root is None:
+        return None
+    bridge_dir = skills_root / SHARED_BRIDGE_DIR_NAME
+    if create:
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+    return bridge_dir
+
+
+def _git_root_for_path(path: str) -> str:
     try:
-        git_root = subprocess.check_output(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        return subprocess.check_output(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        pass
+        return ""
+
+
+def _harness_machine_id() -> str:
+    explicit = os.environ.get("AGENT_BRIDGE_MACHINE_ID")
+    if explicit:
+        return safe_fragment(explicit)
+    return safe_fragment(f"{getpass.getuser()}@{socket.gethostname()}")
+
+
+def register_harness(client: str, *, root: str | None = None, status: str = "active") -> dict[str, Any]:
+    bridge_dir = shared_bridge_dir(root, create=True)
+    assert bridge_dir is not None
+    registry_dir = bridge_dir / SHARED_REGISTRY_DIR_NAME
+    registry_dir.mkdir(parents=True, exist_ok=True)
+
+    cwd = os.environ.get("PWD") or str(Path.cwd())
+    client_id = safe_fragment(client)
+    machine_id = _harness_machine_id()
+    path = registry_dir / f"{machine_id}.{client_id}.json"
+    record: dict[str, Any] = {
+        "schema_version": "1.0",
+        "updated_at": iso_now(),
+        "status": status,
+        "client": client,
+        "machine_id": machine_id,
+        "hostname": socket.gethostname(),
+        "username": getpass.getuser(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "cwd": cwd,
+        "git_root": _git_root_for_path(cwd),
+        "agent_command": shutil.which("agent") or os.environ.get("AGENT_BRIDGE_HOOK_AGENT") or "",
+        "bridge_repo": str(BRIDGE_DIR.parent),
+        "mailbox_mcp": str(BRIDGE_DIR / "mailbox_mcp.py"),
+        "state_dir": str(STATE_DIR),
+        "shared_bridge_dir": str(bridge_dir),
+        "registry_file": str(path),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return record
+
+
+def maybe_register_harness(client: str) -> dict[str, Any] | None:
+    if os.environ.get("AGENT_BRIDGE_DISABLE_SHARED_REGISTRY") in {"1", "true", "TRUE", "yes"}:
+        return None
+    root = resolve_shared_skills_root(required=False, require_bridge_dir=True)
+    if root is None:
+        return None
+    try:
+        return register_harness(client, root=str(root))
+    except OSError:
+        return None
+
+
+def _parse_iso_timestamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def load_harness_registry(root: str | None = None, *, stale_minutes: int = 1440) -> dict[str, Any]:
+    bridge_dir = shared_bridge_dir(root, create=False)
+    assert bridge_dir is not None
+    registry_dir = bridge_dir / SHARED_REGISTRY_DIR_NAME
+    now = dt.datetime.now(dt.timezone.utc)
+    rows: list[dict[str, Any]] = []
+    if registry_dir.exists():
+        for path in sorted(registry_dir.glob("*.json")):
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                row = {"client": "unknown", "machine_id": path.stem, "status": "invalid", "error": str(exc)}
+            updated = _parse_iso_timestamp(row.get("updated_at"))
+            age_seconds = int((now - updated).total_seconds()) if updated else None
+            row["registry_file"] = str(path)
+            row["age_seconds"] = age_seconds
+            row["fresh"] = bool(age_seconds is not None and age_seconds <= stale_minutes * 60 and row.get("status") == "active")
+            rows.append(row)
+    return {
+        "shared_bridge_dir": str(bridge_dir),
+        "registry_dir": str(registry_dir),
+        "stale_minutes": stale_minutes,
+        "harnesses": rows,
+    }
+
+
+def format_harness_registry(data: dict[str, Any]) -> str:
+    lines = [
+        f"Shared Agent Bridge: {data['shared_bridge_dir']}",
+        f"Registry: {data['registry_dir']}",
+        f"Stale after: {data['stale_minutes']} minutes",
+        "",
+    ]
+    rows = data.get("harnesses", [])
+    if not rows:
+        lines.append("(no harness registrations found)")
+        return "\n".join(lines) + "\n"
+    lines.append("fresh\tclient\tmachine\tstatus\tupdated_at\tgit_root")
+    for row in rows:
+        fresh = "yes" if row.get("fresh") else "no"
+        lines.append(
+            "\t".join(
+                [
+                    fresh,
+                    str(row.get("client", "")),
+                    str(row.get("machine_id", "")),
+                    str(row.get("status", "")),
+                    str(row.get("updated_at", "")),
+                    str(row.get("git_root", "")),
+                ]
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_agent_bridge_skill() -> str:
+    return f"""---
+name: agent-bridge
+description: Use when coordinating Codex, Claude, or other coding harnesses through Agent Bridge; checking shared OneDrive harness status; registering a harness heartbeat; using mailbox MCP; or invoking agent code bridge, loop, workflow, hooks, or harness commands across macOS and Windows machines.
+---
+
+# Agent Bridge
+
+Use the installed `agent` command as the front door for local and cross-harness coordination. Prefer the global bridge checkout over project-local copies.
+
+## Fast Checks
+
+- Check shared machine and harness presence: `agent code harness status`
+- Register the current harness manually: `agent code harness register --client <codex|claude|other>`
+- Check local SessionStart hooks: `agent code hooks status --client both`
+- List callable local engines: `agent code bridge --list`
+- Inspect trace events: `agent code trace`
+
+## Coordination
+
+- Use `agent code bridge --from <caller> --to <target> --mode review --prompt "..."` for a bounded one-shot review or plan comparison.
+- Use `agent code bridge --mode code` only for scoped implementation tasks with an explicit worktree.
+- Use `agent code loop` for adversarial builder/critic/verifier loops; keep budgets explicit when cost matters.
+- Use mailbox MCP for async handoffs. Mailbox messages are the durable proof path; shell process lifetime is secondary.
+
+## Shared Registry
+
+The shared OneDrive package lives in a folder named `{SHARED_BRIDGE_DIR_NAME}` under the resolved `SharedAgentSkills` root. Each hooked harness writes one JSON heartbeat under `{SHARED_BRIDGE_DIR_NAME}/{SHARED_REGISTRY_DIR_NAME}/`.
+
+Treat a fresh registry row as "this harness has recently started or resumed and can see the shared folder", not as proof that an existing UI chat is idle or ready to accept work. Use `agent code harness status --json` when another tool needs machine-readable status.
+
+## Path Rules
+
+- Resolve the shared skill root with `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, then `SHARED_AGENT_SKILLS_ROOT`, then the platform OneDrive defaults.
+- macOS default bridge repo: `/Users/tts/Code/agent-bridge`
+- Windows default bridge repo: `%USERPROFILE%\\Code\\agent-bridge`
+- MCP mailbox registrations should point to `agent_bridge/mailbox_mcp.py` in the global bridge repo, not a project-local copy.
+"""
+
+
+def _skill_link_paths(client: str) -> list[Path]:
+    home = Path.home()
+    if client == "codex":
+        return [home / ".codex" / "skills" / SHARED_SKILL_LINK_NAME]
+    if client == "claude":
+        return [home / ".claude" / "skills" / SHARED_SKILL_LINK_NAME]
+    if client == "agents":
+        return [home / ".agents" / "skills" / SHARED_SKILL_LINK_NAME]
+    if client == "all":
+        return _skill_link_paths("codex") + _skill_link_paths("claude") + _skill_link_paths("agents")
+    return []
+
+
+def _ensure_skill_link(link_path: Path, target: Path) -> dict[str, str]:
+    if link_path.exists() or link_path.is_symlink():
+        try:
+            if link_path.resolve() == target.resolve():
+                return {"path": str(link_path), "status": "already linked"}
+        except OSError:
+            pass
+        return {"path": str(link_path), "status": "exists; left unchanged"}
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, link_path, target_is_directory=True)
+        return {"path": str(link_path), "status": "linked"}
+    except OSError as exc:
+        return {"path": str(link_path), "status": f"link failed: {exc}"}
+
+
+def install_shared_skill(root: str | None = None, *, link_client: str = "all") -> dict[str, Any]:
+    bridge_dir = shared_bridge_dir(root, create=True)
+    assert bridge_dir is not None
+    skill_path = bridge_dir / "SKILL.md"
+    content = render_agent_bridge_skill()
+    changed = not skill_path.exists() or skill_path.read_text(encoding="utf-8") != content
+    if changed:
+        skill_path.write_text(content, encoding="utf-8")
+    links = [_ensure_skill_link(path, bridge_dir) for path in _skill_link_paths(link_client)]
+    return {
+        "shared_bridge_dir": str(bridge_dir),
+        "skill_path": str(skill_path),
+        "changed": changed,
+        "links": links,
+    }
+
+
+def format_shared_skill_install(result: dict[str, Any]) -> str:
+    lines = [
+        f"Shared Agent Bridge: {result['shared_bridge_dir']}",
+        f"Skill: {result['skill_path']} ({'updated' if result['changed'] else 'unchanged'})",
+    ]
+    for link in result.get("links", []):
+        lines.append(f"{link['path']}: {link['status']}")
+    return "\n".join(lines) + "\n"
+
+
+def session_start_context(client: str, registration: dict[str, Any] | None = None) -> str:
+    cwd = os.environ.get("PWD") or str(Path.cwd())
+    git_root = _git_root_for_path(cwd)
     location = f" Current git root: {git_root}." if git_root else ""
+    registry = ""
+    if registration:
+        registry = (
+            " Shared registry heartbeat written to "
+            f"`{registration['registry_file']}` for machine `{registration['machine_id']}`."
+        )
     return (
         "Agent Bridge session bootstrap: global command `agent` is available for bounded local "
         "agent coordination. Use `agent code bridge` for one-shot headless review/code turns and "
         "`agent code loop` for adversarial loops; loop dispatch defaults to `--spawn-policy auto`, "
         "which falls back to one analysis-only adversarial agent unless the task is concrete enough "
         "for a full builder/critic/verifier spawn. Mailbox MCP, when registered, should point to "
-        f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. This startup hook only injects "
-        f"context and never spawns agents. Client: {client}.{location}"
+        f"`{BRIDGE_DIR / 'mailbox_mcp.py'}`. Use `agent code harness status` to inspect shared "
+        f"OneDrive harness registrations. This startup hook never spawns agents. Client: {client}."
+        f"{location}{registry}"
     )
 
 
@@ -585,7 +923,8 @@ def hook_session_start(argv: list[str]) -> int:
     parser.add_argument("--client", choices=["codex", "claude"], required=True)
     parser.add_argument("--plain", action="store_true", help="Print plain context instead of hook JSON")
     args = parser.parse_args(argv)
-    context = session_start_context(args.client)
+    registration = maybe_register_harness(args.client)
+    context = session_start_context(args.client, registration=registration)
     if args.plain:
         print(context)
     else:
@@ -698,6 +1037,40 @@ def hooks_cmd(argv: list[str]) -> int:
     return 0
 
 
+def harness_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent code harness", description="Register and inspect shared Agent Bridge harness status.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    install = sub.add_parser("install-skill", help="Install the shared Agent Bridge skill package.")
+    install.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
+    install.add_argument("--link-client", choices=["none", "codex", "claude", "agents", "all"], default="all")
+    install.add_argument("--json", action="store_true")
+
+    register = sub.add_parser("register", help="Write a shared registry heartbeat for this harness.")
+    register.add_argument("--client", required=True, help="Harness/client name, e.g. codex, claude, cursor, aider.")
+    register.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
+    register.add_argument("--status", default="active")
+    register.add_argument("--json", action="store_true")
+
+    status = sub.add_parser("status", help="Show shared Agent Bridge harness registry rows.")
+    status.add_argument("--root", help="SharedAgentSkills root. Defaults to OneDrive/env discovery.")
+    status.add_argument("--stale-minutes", type=int, default=1440)
+    status.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "install-skill":
+        result = install_shared_skill(args.root, link_client=args.link_client)
+        _json_print(result) if args.json else print(format_shared_skill_install(result), end="")
+        return 0
+    if args.cmd == "register":
+        record = register_harness(args.client, root=args.root, status=args.status)
+        _json_print(record) if args.json else print(f"{record['client']}: registered ({record['registry_file']})")
+        return 0
+    data = load_harness_registry(args.root, stale_minutes=args.stale_minutes)
+    _json_print(data) if args.json else print(format_harness_registry(data), end="")
+    return 0
+
+
 def trace_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="agent code trace", description="Inspect agent bridge trace events.")
     parser.add_argument("--run-id")
@@ -795,6 +1168,127 @@ def verdicts_cmd(argv: list[str]) -> int:
     rows = list_verdicts(run_id=args.run_id, status=args.status)
     _json_print(rows) if args.json else print(format_verdicts(rows))
     return 0
+
+
+def workflow_cmd(argv: list[str]) -> int:
+    global PROJECT_DIR
+    parser = argparse.ArgumentParser(prog="agent workflow", description="Run portable workflows across configured agent engines.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    list_parser = sub.add_parser("list", help="List bundled portable workflows.")
+    list_parser.add_argument("--json", action="store_true")
+
+    show = sub.add_parser("show", help="Show a bundled workflow spec summary.")
+    show.add_argument("workflow_id")
+    show.add_argument("--json", action="store_true")
+
+    run = sub.add_parser("run", help="Run a portable workflow.")
+    run.add_argument("workflow_id")
+    run.add_argument("--question", help="Workflow question or task. If omitted, stdin is used.")
+    run.add_argument("--tier", choices=["auto", "shallow", "standard", "deep"], default="auto")
+    run.add_argument("--engine", choices=["auto", "codex", "claude"], default="auto")
+    run.add_argument("--format", choices=["both", "text", "json"], default="both")
+    run.add_argument("--concurrency", type=int, default=4)
+    run.add_argument("--from", dest="source", default=os.environ.get("AGENT_BRIDGE_CALLER", "human"))
+    run.add_argument("--project-dir", help="Project/worktree directory. Defaults to the current git root.")
+    run.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to bridge agent config JSON")
+    run.add_argument("--model", help="Optional engine model override.")
+    run.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    run.add_argument("--dry-run", action="store_true", help="Plan the workflow dispatch without invoking a model.")
+    add_meta_args(run)
+
+    inspect = sub.add_parser("inspect", help="Inspect a saved workflow run.")
+    inspect.add_argument("--run-id", required=True)
+    inspect.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "list":
+        rows = list_workflows()
+        if args.json:
+            _json_print(rows)
+        else:
+            for row in rows:
+                print(f"{row['id']}\t{row['name']}\t{row.get('description', '')}")
+        return 0
+
+    if args.cmd == "show":
+        spec = load_workflow(args.workflow_id)
+        if args.json:
+            _json_print(spec)
+        else:
+            print(f"{spec['id']} - {spec['name']}")
+            print(spec.get("description", ""))
+            print("")
+            print("Phases:")
+            for phase in spec.get("phases", []):
+                print(f"- {phase.get('title')}: {phase.get('detail', '')}")
+            print("")
+            print("Tiers:")
+            for tier, cfg in spec.get("tiers", {}).items():
+                print(f"- {tier}: {cfg.get('angles')} angles, {cfg.get('fetch')} sources, {cfg.get('claims')} claims")
+        return 0
+
+    if args.cmd == "inspect":
+        data = inspect_workflow_run(args.run_id)
+        _json_print(data) if args.json else print(format_inspection(data), end="")
+        return 0
+
+    PROJECT_DIR = Path(args.project_dir).expanduser().resolve() if args.project_dir else discover_project_dir()
+    question = args.question or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    if not question:
+        raise BridgeError("a workflow question is required")
+    meta = ensure_run_meta(extract_meta(args))
+    if args.dry_run:
+        plan = plan_workflow_run(
+            workflow_id=args.workflow_id,
+            question=question,
+            tier=args.tier,
+            engine=args.engine,
+            source=args.source,
+            meta=meta,
+        )
+        _json_print(plan) if args.format == "json" else print(format_workflow_plan(plan), end="")
+        return 0
+
+    config = load_config(Path(args.config))
+    result = run_workflow(
+        workflow_id=args.workflow_id,
+        question=question,
+        tier=args.tier,
+        engine=args.engine,
+        source=args.source,
+        agents=agent_map(config),
+        project_dir=PROJECT_DIR,
+        concurrency=args.concurrency,
+        fmt=args.format,
+        model=args.model,
+        budget_usd=str(args.budget_usd),
+        meta=meta,
+    )
+    if args.format == "json":
+        _json_print(result)
+    elif args.format == "text":
+        print(format_report(result), end="")
+    else:
+        print(format_report(result), end="")
+        print("")
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def format_workflow_plan(plan: dict[str, Any]) -> str:
+    phases = "\n".join(f"- {phase}" for phase in plan.get("phases", []))
+    return (
+        f"Workflow: {plan['workflow_id']} ({plan['name']})\n"
+        f"Run: {plan['run_id']}\n"
+        f"Engine: {plan['engine']}\n"
+        f"Tier: {plan['tier']}\n"
+        f"Question: {plan['question']}\n"
+        f"Artifact dir: {plan['artifact_dir']}\n"
+        "Dry run: yes\n\n"
+        f"Phases:\n{phases}\n"
+    )
 
 
 def parse_loop_args(argv: list[str]) -> argparse.Namespace:
@@ -957,6 +1451,8 @@ def loop(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) >= 1 and argv[0] == "workflow":
+        return workflow_cmd(argv[1:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "bridge":
         return bridge(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "loop":
@@ -971,6 +1467,8 @@ def main(argv: list[str]) -> int:
         return hook_session_start(argv[3:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "hooks":
         return hooks_cmd(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "harness":
+        return harness_cmd(argv[2:])
     if len(argv) >= 1 and argv[0] == "bridge":
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
@@ -980,6 +1478,8 @@ def main(argv: list[str]) -> int:
     print("       agent code verdicts <record|list> [options]", file=sys.stderr)
     print("       agent code hook session-start [options]", file=sys.stderr)
     print("       agent code hooks <install|status> [options]", file=sys.stderr)
+    print("       agent code harness <install-skill|register|status> [options]", file=sys.stderr)
+    print("       agent workflow <list|show|run|inspect> [options]", file=sys.stderr)
     print("       agent bridge [options]", file=sys.stderr)
     return 2
 
@@ -987,7 +1487,7 @@ def main(argv: list[str]) -> int:
 def main_entry() -> None:
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (BridgeError, ValueError) as exc:
+    except (BridgeError, WorkflowError, ValueError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         raise SystemExit(2)
 
@@ -995,6 +1495,6 @@ def main_entry() -> None:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (BridgeError, ValueError) as exc:
+    except (BridgeError, WorkflowError, ValueError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         raise SystemExit(2)

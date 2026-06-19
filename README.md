@@ -7,6 +7,7 @@ The bridge has two surfaces:
 - `agent code bridge` invokes a fresh headless turn of a configured agent CLI for review or
   local coding work.
 - `mailbox_mcp.py` exposes a small shared mailbox as MCP tools for async handoff.
+- `agent workflow` runs portable, structured workflows through configured agent engines.
 
 The bridge is local developer infrastructure. It is not a daemon and it does not attach to
 existing UI sessions.
@@ -79,13 +80,22 @@ agent code hooks install --client both
 ```
 
 The hook injects a short reminder that Agent Bridge is available, points agents at the global
-mailbox MCP path, and notes that `agent code loop` uses the auto dispatch gate. It does not spawn
-agents, run network calls, or mutate project files during session startup.
+mailbox MCP path, and notes that `agent code loop` uses the auto dispatch gate. If a shared
+OneDrive `SharedAgentSkills/Agent-Bridge` folder is available, it also writes a small JSON
+heartbeat for the current harness. It does not spawn agents, run network calls, or mutate project
+files during session startup.
 
 Check hook status:
 
 ```bash
 agent code hooks status --client both
+```
+
+Install or refresh the shared Agent Bridge skill package and link it into local harness skill
+roots:
+
+```bash
+agent code harness install-skill
 ```
 
 On Windows, `.\scripts\install.ps1` runs the same hook installer automatically. To also attempt
@@ -142,6 +152,38 @@ full spawn, it dispatches one analysis-only adversarial agent instead. Use
 `--spawn-policy full` to force the full loop, or `--spawn-policy adversarial-only` to always run
 the single-review fallback.
 
+Inspect cross-machine harness registrations from the shared OneDrive folder:
+
+```bash
+agent code harness status
+agent code harness status --json
+agent code harness register --client codex
+```
+
+The shared registry is a OneDrive-friendly heartbeat store, not a daemon and not direct IPC. A
+fresh row means that a harness on that machine recently started or resumed and could see the
+shared folder. It does not prove that an existing UI session is idle, authenticated, or ready to
+accept work.
+
+Run portable deep research with a consistent command and output shape:
+
+```bash
+agent workflow list
+agent workflow show deep-research-lite
+agent workflow run deep-research-lite --engine codex --tier shallow \
+  --question "What changed in Python 3.13?"
+agent workflow inspect --run-id run_...
+```
+
+`agent workflow run` defaults the engine from `--engine`, then `--from` or
+`AGENT_BRIDGE_CALLER`, and falls back to `codex`. It prints a Markdown report by default and
+stores `manifest.json`, `report.md`, `result.json`, per-call prompts/responses, and fetched
+source excerpts under:
+
+```text
+~/.local/state/agent-bridge/workflows/<run_id>/
+```
+
 Inspect trace events and structured findings:
 
 ```bash
@@ -163,6 +205,19 @@ Runtime state is outside repositories:
   transcripts/
   mailbox/messages.jsonl
 ```
+
+Cross-machine status lives in the shared skills folder when configured:
+
+```text
+SharedAgentSkills/
+  Agent-Bridge/
+    SKILL.md
+    registry/
+      <machine>.<client>.json
+```
+
+Root discovery checks `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, `SHARED_AGENT_SKILLS_ROOT`,
+`CAREER_SHARED_SKILLS_ROOT`, OneDrive environment variables, then the platform defaults.
 
 Override with:
 
