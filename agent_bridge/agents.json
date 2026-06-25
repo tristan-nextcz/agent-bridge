@@ -1,0 +1,20 @@
+{
+  "agents": [
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "adapter": "claude_code",
+      "command": "claude",
+      "env_command": "CLAUDE_BIN",
+      "description": "Anthropic Claude Code headless CLI"
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "adapter": "codex_exec",
+      "command": "codex",
+      "env_command": "CODEX_BIN",
+      "description": "OpenAI Codex headless CLI"
+    }
+  ]
+}
