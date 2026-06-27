@@ -1386,7 +1386,7 @@ Treat a fresh registry row as "this harness has recently started or resumed and 
 ## Path Rules
 
 - Resolve the shared skill root with `AGENT_BRIDGE_SHARED_SKILLS_ROOT`, then `SHARED_AGENT_SKILLS_ROOT`, then the platform OneDrive defaults.
-- macOS default bridge repo: `/Users/tts/Code/agent-bridge`
+- macOS default bridge repo: `~/Code/agent-bridge`
 - Windows default bridge repo: `%USERPROFILE%\\Code\\agent-bridge`
 - MCP mailbox registrations should point to `agent_bridge/mailbox_mcp.py` in the global bridge repo, not a project-local copy.
 """
