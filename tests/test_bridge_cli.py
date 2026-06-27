@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,60 @@ AGENT = ROOT / "bin" / "agent"
 
 
 class BridgeCliTests(unittest.TestCase):
+    def _write_fake_claude(self, tmp: str) -> Path:
+        fake = Path(tmp) / "fake_claude.py"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "log = Path(os.environ['FAKE_CLAUDE_LOG'])\n"
+            "marker = Path(os.environ.get('FAKE_CLAUDE_AUTH_MARKER', log.with_suffix('.auth')))\n"
+            "def log_line(text):\n"
+            "    log.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    with log.open('a', encoding='utf-8') as handle:\n"
+            "        handle.write(text + '\\n')\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['auth', 'status']:\n"
+            "    print(json.dumps({'loggedIn': True, 'email': 'user@example.test'}))\n"
+            "    raise SystemExit(0)\n"
+            "if args[:2] == ['auth', 'logout']:\n"
+            "    log_line('logout')\n"
+            "    raise SystemExit(0)\n"
+            "if args[:2] == ['auth', 'login']:\n"
+            "    log_line('login ' + ' '.join(args[2:]))\n"
+            "    marker.write_text('ok', encoding='utf-8')\n"
+            "    print('Login successful.')\n"
+            "    raise SystemExit(0)\n"
+            "if '-p' in args:\n"
+            "    prompt = args[args.index('-p') + 1]\n"
+            "    budget = '0'\n"
+            "    if '--max-budget-usd' in args:\n"
+            "        budget = args[args.index('--max-budget-usd') + 1]\n"
+            "    log_line('budget ' + budget)\n"
+            "    if os.environ.get('FAKE_CLAUDE_AUTH_FAIL') == '1' and not marker.exists():\n"
+            "        print('Failed to authenticate. API Error: 401 Invalid authentication credentials')\n"
+            "        raise SystemExit(1)\n"
+            "    if float(budget) < float(os.environ.get('FAKE_CLAUDE_MIN_BUDGET', '0.5')):\n"
+            "        print(f'Error: Exceeded USD budget ({budget})')\n"
+            "        raise SystemExit(1)\n"
+            "    if 'CLAUDE_DIRECT_OK' in prompt:\n"
+            "        print('CLAUDE_DIRECT_OK')\n"
+            "    elif 'BRIDGE_REPAIR_OK' in prompt:\n"
+            "        print('BRIDGE_REPAIR_OK')\n"
+            "    elif 'BRIDGE_LIVE_OK' in prompt:\n"
+            "        print('BRIDGE_LIVE_OK')\n"
+            "    else:\n"
+            "        print('FAKE_CLAUDE_OK')\n"
+            "    raise SystemExit(0)\n"
+            "print('unexpected fake claude args: ' + ' '.join(args))\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake
+
     def test_list_agents(self) -> None:
         proc = subprocess.run(
             [str(AGENT), "code", "bridge", "--list"],
@@ -211,6 +266,179 @@ class BridgeCliTests(unittest.TestCase):
         self.assertIn("codex exec", proc.stdout)
         self.assertIn("-s read-only", proc.stdout)
         self.assertNotIn("-a never", proc.stdout)
+
+    def test_bridge_dry_run_converts_heic_prompt_paths_for_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "sample"
+            repo.mkdir()
+            photo = repo / "Vacation Photo.HEIC"
+            photo.write_bytes(b"fake heic")
+            converter = Path(tmp) / "convert_heic.py"
+            converter.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(sys.argv[2]).write_bytes(b'fake png')\n",
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
+                "AGENT_BRIDGE_HEIC_CONVERTER": f"{sys.executable} {converter}",
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "review",
+                    "--prompt",
+                    f'Please inspect "{photo}"',
+                    "--dry-run",
+                ],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            converted = list((Path(tmp) / "state" / "media").rglob("*.png"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(converted), 1)
+        self.assertIn("[AGENT BRIDGE MEDIA]", proc.stdout)
+        self.assertIn(str(photo), proc.stdout)
+        self.assertIn(str(converted[0]), proc.stdout)
+        self.assertIn(f"--add-dir {converted[0].parent}", proc.stdout)
+
+    def test_bridge_heic_conversion_failure_does_not_block_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "sample"
+            repo.mkdir()
+            photo = repo / "broken.heic"
+            photo.write_bytes(b"fake heic")
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(Path(tmp) / "state"),
+                "AGENT_BRIDGE_HEIC_CONVERTER": str(Path(tmp) / "missing-converter"),
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "review",
+                    "--prompt",
+                    f"Please inspect {photo}",
+                    "--dry-run",
+                ],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Could not convert these HEIC/HEIF inputs", proc.stdout)
+        self.assertIn("missing-converter", proc.stdout)
+
+    def test_bridge_retries_and_records_budget_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._write_fake_claude(tmp)
+            state = Path(tmp) / "state"
+            log = Path(tmp) / "fake.log"
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(state),
+                "CLAUDE_BIN": str(fake),
+                "FAKE_CLAUDE_LOG": str(log),
+                "FAKE_CLAUDE_MIN_BUDGET": "0.5",
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "bridge",
+                    "--from",
+                    "human",
+                    "--to",
+                    "claude",
+                    "--mode",
+                    "review",
+                    "--budget-usd",
+                    "0.05",
+                    "--prompt",
+                    "Reply exactly: BRIDGE_LIVE_OK",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            state_payload = json.loads((state / "connections.json").read_text(encoding="utf-8"))
+            log_lines = [line.strip() for line in log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("BRIDGE_LIVE_OK", proc.stdout)
+        self.assertIn("budget 0.05 was too low; retrying with 0.1", proc.stderr)
+        self.assertIn("budget 0.2 was too low; retrying with 0.5", proc.stderr)
+        self.assertEqual(state_payload["agents"]["claude"]["calibrated_budget_usd"], "0.5")
+        self.assertEqual(log_lines, ["budget 0.05", "budget 0.1", "budget 0.2", "budget 0.5"])
+
+    def test_repair_refreshes_claude_auth_and_checks_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = self._write_fake_claude(tmp)
+            state = Path(tmp) / "state"
+            log = Path(tmp) / "fake.log"
+            marker = Path(tmp) / "auth.marker"
+            env = {
+                **os.environ,
+                "AGENT_BRIDGE_STATE_DIR": str(state),
+                "CLAUDE_BIN": str(fake),
+                "FAKE_CLAUDE_LOG": str(log),
+                "FAKE_CLAUDE_AUTH_MARKER": str(marker),
+                "FAKE_CLAUDE_AUTH_FAIL": "1",
+                "FAKE_CLAUDE_MIN_BUDGET": "0.5",
+                "AGENT_BRIDGE_CLAUDE_EMAIL": "user@example.test",
+            }
+            proc = subprocess.run(
+                [
+                    str(AGENT),
+                    "code",
+                    "repair",
+                    "--to",
+                    "claude",
+                    "--budget-usd",
+                    "0.5",
+                    "--max-auto-budget-usd",
+                    "0.5",
+                ],
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            state_payload = json.loads((state / "connections.json").read_text(encoding="utf-8"))
+            marker_exists = marker.exists()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(marker_exists)
+        self.assertIn("claude direct probe failed auth; refreshing Claude login", proc.stdout)
+        self.assertIn("claude direct probe: ok at budget 0.5", proc.stdout)
+        self.assertIn("BRIDGE_REPAIR_OK", proc.stdout)
+        self.assertEqual(state_payload["agents"]["claude"]["last_status"], "ok")
 
     def test_bridge_child_role_uses_target_not_forwarded_caller_role(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

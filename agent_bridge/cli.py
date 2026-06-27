@@ -16,16 +16,19 @@ import argparse
 from dataclasses import dataclass
 import datetime as dt
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from .correlation import add_meta_args, child_turn_meta, ensure_run_meta, extract_meta, format_meta, iso_now, safe_fragment, utc_stamp
 from .findings import (
@@ -55,10 +58,25 @@ DEFAULT_CONFIG = BRIDGE_DIR / "agents.json"
 STATE_DIR = Path(os.environ.get("AGENT_BRIDGE_STATE_DIR", Path.home() / ".local/state/agent-bridge")).expanduser()
 TRANSCRIPT_DIR = STATE_DIR / "transcripts"
 BRIDGE_LOG = STATE_DIR / "bridge_agents.log"
+MEDIA_DIR = STATE_DIR / "media"
+CONNECTION_STATE = STATE_DIR / "connections.json"
 PROJECT_DIR = Path.cwd()
 SHARED_BRIDGE_DIR_NAME = "Agent-Bridge"
 SHARED_REGISTRY_DIR_NAME = "registry"
 SHARED_SKILL_LINK_NAME = "agent-bridge"
+DEFAULT_BUDGET_USD = "0.50"
+DEFAULT_REPAIR_BUDGET_USD = "0.05"
+DEFAULT_MAX_AUTO_BUDGET_USD = "1.00"
+BUDGET_RETRY_LADDER = [0.10, 0.20, 0.50, 1.00, 2.00, 5.00]
+HEIC_SUFFIXES = {".heic", ".heif"}
+QUOTED_HEIC_PATH_RE = re.compile(
+    r"""(?P<quote>['"`])(?P<path>(?:file://)?(?:~|/|\.{1,2}/|[A-Za-z]:[\\/])[^'"`\n]*?\.(?:heic|heif))(?P=quote)""",
+    re.IGNORECASE,
+)
+UNQUOTED_HEIC_PATH_RE = re.compile(
+    r"""(?P<path>(?:file://)?(?:~|/|\.{1,2}/|[A-Za-z]:[\\/])[^\s\]\)>,;:]+?\.(?:heic|heif))(?=$|[\s\]\)>,;:])""",
+    re.IGNORECASE,
+)
 
 
 class BridgeError(RuntimeError):
@@ -70,6 +88,29 @@ class SpawnDecision:
     mode: str
     score: int
     reasons: list[str]
+
+
+@dataclass(frozen=True)
+class PromptMedia:
+    prompt: str
+    media_dirs: list[Path]
+    conversions: list[tuple[Path, Path]]
+    failures: list[tuple[Path, str]]
+
+
+@dataclass(frozen=True)
+class AgentRunResult:
+    return_code: int
+    output: str
+    transcript: Path | None = None
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    ok: bool
+    budget_usd: str
+    output: str
+    repaired_auth: bool = False
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -214,6 +255,213 @@ def read_prompt(args: argparse.Namespace) -> str:
     return ""
 
 
+def _load_connection_state() -> dict[str, Any]:
+    if not CONNECTION_STATE.exists():
+        return {"schema_version": "1.0", "agents": {}}
+    try:
+        data = json.loads(CONNECTION_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"schema_version": "1.0", "agents": {}}
+    if not isinstance(data, dict):
+        return {"schema_version": "1.0", "agents": {}}
+    data.setdefault("schema_version", "1.0")
+    if not isinstance(data.get("agents"), dict):
+        data["agents"] = {}
+    return data
+
+
+def _write_connection_state(data: dict[str, Any]) -> None:
+    CONNECTION_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONNECTION_STATE.with_suffix(CONNECTION_STATE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(CONNECTION_STATE)
+
+
+def _agent_connection_state(agent_id: str) -> dict[str, Any]:
+    data = _load_connection_state()
+    agents = data.setdefault("agents", {})
+    row = agents.setdefault(agent_id, {})
+    return row if isinstance(row, dict) else {}
+
+
+def record_agent_connection(agent_id: str, **updates: Any) -> None:
+    data = _load_connection_state()
+    agents = data.setdefault("agents", {})
+    row = agents.setdefault(agent_id, {})
+    if not isinstance(row, dict):
+        row = {}
+        agents[agent_id] = row
+    row.update({key: value for key, value in updates.items() if value is not None})
+    row["updated_at"] = iso_now()
+    _write_connection_state(data)
+
+
+def _budget_float(value: str | float | int) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(f"budget must be a number, got {value!r}") from exc
+
+
+def _format_budget(value: str | float | int) -> str:
+    number = _budget_float(value)
+    text = f"{number:.2f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def calibrated_budget(agent_id: str, requested: str, *, enabled: bool = True) -> str:
+    if not enabled:
+        return requested
+    row = _agent_connection_state(agent_id)
+    stored = row.get("calibrated_budget_usd")
+    if not stored:
+        return requested
+    try:
+        return _format_budget(max(_budget_float(requested), _budget_float(stored)))
+    except BridgeError:
+        return requested
+
+
+def next_budget(current: str, max_budget: str) -> str | None:
+    current_value = _budget_float(current)
+    max_value = _budget_float(max_budget)
+    for candidate in BUDGET_RETRY_LADDER:
+        if candidate > current_value + 0.000001:
+            return _format_budget(candidate) if candidate <= max_value + 0.000001 else None
+    doubled = current_value * 2
+    return _format_budget(doubled) if doubled <= max_value + 0.000001 else None
+
+
+def is_budget_error(output: str) -> bool:
+    return "Exceeded USD budget" in output
+
+
+def is_auth_error(output: str) -> bool:
+    lowered = output.lower()
+    return "failed to authenticate" in lowered or "invalid authentication credentials" in lowered or "401" in lowered
+
+
+def _iter_prompt_heic_candidates(prompt: str) -> list[str]:
+    candidates: list[str] = []
+    for pattern in (QUOTED_HEIC_PATH_RE, UNQUOTED_HEIC_PATH_RE):
+        for match in pattern.finditer(prompt):
+            candidates.append(match.group("path"))
+    return candidates
+
+
+def _resolve_prompt_path(raw_path: str, *, project_dir: Path) -> Path:
+    text = raw_path.strip()
+    if text.lower().startswith("file://"):
+        parsed = urlparse(text)
+        text = unquote(parsed.path)
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path.resolve()
+
+
+def discover_prompt_heic_inputs(prompt: str, *, project_dir: Path) -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in _iter_prompt_heic_candidates(prompt):
+        path = _resolve_prompt_path(raw_path, project_dir=project_dir)
+        if path.suffix.lower() not in HEIC_SUFFIXES or not path.exists() or not path.is_file():
+            continue
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            found.append(path)
+    return found
+
+
+def _media_cache_dir(project_dir: Path) -> Path:
+    digest = hashlib.sha256(str(project_dir).encode("utf-8")).hexdigest()[:12]
+    return MEDIA_DIR / f"{safe_fragment(project_dir.name)}-{digest}"
+
+
+def _converted_media_path(source: Path, *, project_dir: Path) -> Path:
+    stat = source.stat()
+    key = f"{source}\0{stat.st_mtime_ns}\0{stat.st_size}".encode("utf-8")
+    digest = hashlib.sha256(key).hexdigest()[:12]
+    return _media_cache_dir(project_dir) / f"{safe_fragment(source.stem)}-{digest}.png"
+
+
+def _heic_converter_command(source: Path, output: Path) -> list[str]:
+    override = os.environ.get("AGENT_BRIDGE_HEIC_CONVERTER")
+    if override:
+        return [*shlex.split(override), str(source), str(output)]
+
+    if platform.system() == "Darwin":
+        sips = shutil.which("sips")
+        if sips:
+            return [sips, "-s", "format", "png", str(source), "--out", str(output)]
+
+    magick = shutil.which("magick")
+    if magick:
+        return [magick, str(source), str(output)]
+
+    convert = shutil.which("convert")
+    if convert:
+        return [convert, str(source), str(output)]
+
+    raise BridgeError("no HEIC converter found; install ImageMagick or use macOS sips")
+
+
+def convert_heic_to_png(source: Path, *, project_dir: Path) -> Path:
+    output = _converted_media_path(source, project_dir=project_dir)
+    if output.exists() and output.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+        return output
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_name(f"{output.stem}.tmp{output.suffix}")
+    if tmp.exists():
+        tmp.unlink()
+    cmd = _heic_converter_command(source, tmp)
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise BridgeError(detail or f"converter exited {exc.returncode}") from exc
+    except OSError as exc:
+        raise BridgeError(str(exc)) from exc
+
+    if not tmp.exists():
+        raise BridgeError("converter did not produce an output file")
+    tmp.replace(output)
+    return output
+
+
+def prepare_prompt_media(prompt: str, *, project_dir: Path) -> PromptMedia:
+    inputs = discover_prompt_heic_inputs(prompt, project_dir=project_dir)
+    if not inputs:
+        return PromptMedia(prompt=prompt, media_dirs=[], conversions=[], failures=[])
+
+    conversions: list[tuple[Path, Path]] = []
+    failures: list[tuple[Path, str]] = []
+    for source in inputs:
+        try:
+            conversions.append((source, convert_heic_to_png(source, project_dir=project_dir)))
+        except BridgeError as exc:
+            failures.append((source, str(exc)))
+
+    lines = ["[AGENT BRIDGE MEDIA]"]
+    if conversions:
+        lines.append("Converted HEIC/HEIF inputs to PNG for agent compatibility:")
+        lines.extend(f"- {source} -> {output}" for source, output in conversions)
+        lines.append("Use the PNG path if the target agent cannot decode HEIC/HEIF directly.")
+    if failures:
+        lines.append("Could not convert these HEIC/HEIF inputs:")
+        lines.extend(f"- {source}: {reason}" for source, reason in failures)
+
+    media_dirs = sorted({output.parent for _, output in conversions}, key=str)
+    return PromptMedia(
+        prompt=f"{prompt.rstrip()}\n\n" + "\n".join(lines) + "\n",
+        media_dirs=media_dirs,
+        conversions=conversions,
+        failures=failures,
+    )
+
+
 IMPLEMENTATION_TERMS = {
     "add",
     "build",
@@ -349,9 +597,11 @@ def command_for_agent(
     prompt: str,
     scope: str,
     budget_usd: str,
+    media_dirs: list[Path] | None = None,
 ) -> list[str]:
     command = resolve_command(agent)
     adapter = agent.get("adapter")
+    media_dirs = media_dirs or []
     if adapter == "claude_code":
         permission_mode = "acceptEdits" if mode == "code" else "auto"
         cmd = [
@@ -369,6 +619,8 @@ def command_for_agent(
             "--output-format",
             "text",
         ]
+        for media_dir in media_dirs:
+            cmd.extend(["--add-dir", str(media_dir)])
         if mode == "review":
             cmd.extend(["--allowedTools", "Read,Grep,Glob"])
         return cmd
@@ -396,6 +648,7 @@ def command_for_agent(
             "source": source,
             "target": agent["id"],
             "budget_usd": budget_usd,
+            "media_dirs": os.pathsep.join(str(path) for path in media_dirs),
         }
         return [command, *fill_template([str(part) for part in templates], values)]
     raise BridgeError(f"agent {agent['id']} has unsupported adapter {adapter!r}")
@@ -422,7 +675,7 @@ def write_header(
         handle.write("\n\n=== Agent response ===\n")
 
 
-def invoke_target(
+def _invoke_target_once(
     agent: dict[str, Any],
     *,
     source: str,
@@ -431,10 +684,19 @@ def invoke_target(
     budget_usd: str,
     dry_run: bool,
     meta: dict[str, Any] | None = None,
-) -> int:
+    media_dirs: list[Path] | None = None,
+) -> AgentRunResult:
     meta = meta or {}
     scope = build_scope(source, agent, mode, meta)
-    cmd = command_for_agent(agent, source=source, mode=mode, prompt=prompt, scope=scope, budget_usd=budget_usd)
+    cmd = command_for_agent(
+        agent,
+        source=source,
+        mode=mode,
+        prompt=prompt,
+        scope=scope,
+        budget_usd=budget_usd,
+        media_dirs=media_dirs,
+    )
     emit_event(
         "agent.dispatched",
         run_id=meta.get("run_id"),
@@ -449,7 +711,7 @@ def invoke_target(
             meta=meta,
             data={"target": agent["id"], "mode": mode, "return_code": 0, "dry_run": True},
         )
-        return 0
+        return AgentRunResult(return_code=0, output="")
 
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     prefix = safe_fragment(meta.get("run_id", agent["id"]))
@@ -457,6 +719,7 @@ def invoke_target(
     transcript = TRANSCRIPT_DIR / f"{prefix}_{turn}_{agent['id']}_{utc_stamp()}.txt"
     write_header(transcript, source=source, target=agent["id"], mode=mode, prompt=prompt, cmd=cmd, meta=meta)
 
+    output: list[str] = []
     with transcript.open("a", encoding="utf-8") as transcript_handle, BRIDGE_LOG.open("a", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
             cmd,
@@ -469,6 +732,7 @@ def invoke_target(
         assert process.stdout is not None
         for line in process.stdout:
             print(line, end="")
+            output.append(line)
             transcript_handle.write(line)
             log_handle.write(line)
         rc = process.wait()
@@ -479,7 +743,65 @@ def invoke_target(
         data={"target": agent["id"], "mode": mode, "return_code": rc, "dry_run": False, "transcript": str(transcript)},
     )
     print(f"\n[transcript] {transcript}", file=sys.stderr)
-    return rc
+    return AgentRunResult(return_code=rc, output="".join(output), transcript=transcript)
+
+
+def invoke_target(
+    agent: dict[str, Any],
+    *,
+    source: str,
+    mode: str,
+    prompt: str,
+    budget_usd: str,
+    dry_run: bool,
+    meta: dict[str, Any] | None = None,
+    media_dirs: list[Path] | None = None,
+    budget_auto: bool = True,
+    max_auto_budget_usd: str = DEFAULT_MAX_AUTO_BUDGET_USD,
+) -> int:
+    budget = calibrated_budget(agent["id"], budget_usd, enabled=budget_auto and not dry_run)
+    while True:
+        result = _invoke_target_once(
+            agent,
+            source=source,
+            mode=mode,
+            prompt=prompt,
+            budget_usd=budget,
+            dry_run=dry_run,
+            meta=meta,
+            media_dirs=media_dirs,
+        )
+        if result.return_code == 0:
+            if budget_auto and not dry_run:
+                record_agent_connection(agent["id"], calibrated_budget_usd=_format_budget(budget), last_status="ok")
+            return 0
+        if is_auth_error(result.output):
+            record_agent_connection(agent["id"], last_status="auth_failed", last_error="auth")
+            print(
+                f"[agent-bridge] {agent['id']}: authentication failed. "
+                f"Run `agent code repair --to {agent['id']} --repair-auth` to refresh credentials.",
+                file=sys.stderr,
+            )
+            return result.return_code
+        if not budget_auto or dry_run or not is_budget_error(result.output):
+            return result.return_code
+        retry_budget = next_budget(budget, max_auto_budget_usd)
+        if retry_budget is None:
+            record_agent_connection(agent["id"], last_status="budget_failed", last_error="budget", calibrated_budget_usd=_format_budget(budget))
+            print(
+                f"[agent-bridge] {agent['id']}: budget {budget} was too low and "
+                f"max auto budget {max_auto_budget_usd} was reached.",
+                file=sys.stderr,
+            )
+            return result.return_code
+        emit_event(
+            "agent.budget_retry",
+            run_id=(meta or {}).get("run_id"),
+            meta=meta or {},
+            data={"target": agent["id"], "from_budget_usd": _format_budget(budget), "to_budget_usd": retry_budget},
+        )
+        print(f"[agent-bridge] {agent['id']}: budget {budget} was too low; retrying with {retry_budget}", file=sys.stderr)
+        budget = retry_budget
 
 
 def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
@@ -493,7 +815,13 @@ def parse_bridge_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--to", dest="targets", help="Target agent ids, numbers, comma list, or 'all'")
     parser.add_argument("--mode", choices=["review", "code"], help="Bridge mode")
     parser.add_argument("--prompt", help="Task prompt. If omitted in non-interactive mode, stdin is used.")
-    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", DEFAULT_BUDGET_USD))
+    parser.add_argument("--no-budget-auto", action="store_true", help="Disable automatic budget retry/calibration")
+    parser.add_argument(
+        "--max-auto-budget-usd",
+        default=os.environ.get("AGENT_BRIDGE_MAX_AUTO_BUDGET_USD", DEFAULT_MAX_AUTO_BUDGET_USD),
+        help="Maximum budget cap Agent Bridge may use when retrying budget failures.",
+    )
     parser.add_argument("--list", action="store_true", help="List configured agents and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print target commands without invoking agents")
     add_meta_args(parser)
@@ -520,6 +848,8 @@ def bridge(argv: list[str]) -> int:
         raise BridgeError("a task prompt is required")
     if not args.targets:
         raise BridgeError("at least one target agent is required")
+    media = prepare_prompt_media(prompt, project_dir=PROJECT_DIR)
+    prompt = media.prompt
 
     targets = resolve_agent_ids(args.targets, agents)
     base_meta = ensure_run_meta(extract_meta(args))
@@ -545,6 +875,9 @@ def bridge(argv: list[str]) -> int:
             budget_usd=str(args.budget_usd),
             dry_run=args.dry_run,
             meta=target_meta,
+            media_dirs=media.media_dirs,
+            budget_auto=not args.no_budget_auto,
+            max_auto_budget_usd=str(args.max_auto_budget_usd),
         )
         if target_rc != 0:
             rc = target_rc
@@ -800,6 +1133,214 @@ def format_harness_registry(data: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _run_capture(cmd: list[str], *, cwd: Path | None = None, timeout: int = 60) -> AgentRunResult:
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd or PROJECT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return AgentRunResult(return_code=proc.returncode, output=proc.stdout or "")
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        return AgentRunResult(return_code=124, output=output or f"timed out after {timeout}s")
+
+
+def _claude_auth_status(command: str) -> tuple[dict[str, Any] | None, str]:
+    result = _run_capture([command, "auth", "status"], timeout=30)
+    if result.return_code != 0:
+        return None, result.output
+    try:
+        payload = json.loads(result.output)
+    except json.JSONDecodeError:
+        return None, result.output
+    return payload if isinstance(payload, dict) else None, result.output
+
+
+def _run_auth_refresh(command: str, *, email: str | None, sso: bool, timeout: int) -> AgentRunResult:
+    _run_capture([command, "auth", "logout"], timeout=30)
+    cmd = [command, "auth", "login", "--claudeai"]
+    if email:
+        cmd.extend(["--email", email])
+    if sso:
+        cmd.append("--sso")
+    try:
+        proc = subprocess.run(cmd, cwd=str(PROJECT_DIR), text=True, timeout=timeout, check=False)
+        return AgentRunResult(return_code=proc.returncode, output="")
+    except subprocess.TimeoutExpired as exc:
+        return AgentRunResult(return_code=124, output=(exc.stdout or "") + (exc.stderr or "") or f"timed out after {timeout}s")
+
+
+def _budgeted_probe(
+    *,
+    agent: dict[str, Any],
+    prompt: str,
+    expected: str,
+    budget_usd: str,
+    max_auto_budget_usd: str,
+) -> ProbeResult:
+    command = resolve_command(agent)
+    budget = calibrated_budget(agent["id"], budget_usd, enabled=True)
+    while True:
+        result = _run_capture(
+            [command, "-p", prompt, "--max-budget-usd", budget, "--output-format", "text"],
+            timeout=120,
+        )
+        if result.return_code == 0 and expected in result.output:
+            record_agent_connection(agent["id"], direct_budget_usd=_format_budget(budget), last_direct_status="ok")
+            return ProbeResult(ok=True, budget_usd=_format_budget(budget), output=result.output)
+        if not is_budget_error(result.output):
+            return ProbeResult(ok=False, budget_usd=_format_budget(budget), output=result.output)
+        retry_budget = next_budget(budget, max_auto_budget_usd)
+        if retry_budget is None:
+            return ProbeResult(ok=False, budget_usd=_format_budget(budget), output=result.output)
+        print(f"[agent-bridge] {agent['id']}: direct probe budget {budget} was too low; retrying with {retry_budget}", file=sys.stderr)
+        budget = retry_budget
+
+
+def _repair_claude(
+    agent: dict[str, Any],
+    *,
+    source: str,
+    email: str | None,
+    sso: bool,
+    repair_auth: bool,
+    budget_usd: str,
+    max_auto_budget_usd: str,
+    auth_timeout: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    command = resolve_command(agent)
+    status, status_output = _claude_auth_status(command)
+    status_email = status.get("email") if status else None
+    print(f"claude auth status: {'ok' if status else 'failed'}")
+    if status_email:
+        print(f"claude account: {status_email}")
+
+    direct = _budgeted_probe(
+        agent=agent,
+        prompt="Reply exactly: CLAUDE_DIRECT_OK",
+        expected="CLAUDE_DIRECT_OK",
+        budget_usd=budget_usd,
+        max_auto_budget_usd=max_auto_budget_usd,
+    )
+    repaired_auth = False
+    if not direct.ok and is_auth_error(direct.output) and repair_auth:
+        repair_email = email or status_email
+        print("claude direct probe failed auth; refreshing Claude login...")
+        if dry_run:
+            return {"target": agent["id"], "status": "would_repair_auth", "email": repair_email or ""}
+        refresh = _run_auth_refresh(command, email=repair_email, sso=sso, timeout=auth_timeout)
+        if refresh.return_code != 0:
+            record_agent_connection(agent["id"], last_status="auth_repair_failed", last_error=refresh.output)
+            return {"target": agent["id"], "status": "auth_repair_failed", "output": refresh.output}
+        repaired_auth = True
+        status, status_output = _claude_auth_status(command)
+        direct = _budgeted_probe(
+            agent=agent,
+            prompt="Reply exactly: CLAUDE_DIRECT_OK",
+            expected="CLAUDE_DIRECT_OK",
+            budget_usd=budget_usd,
+            max_auto_budget_usd=max_auto_budget_usd,
+        )
+
+    if not direct.ok:
+        record_agent_connection(agent["id"], last_status="direct_probe_failed", last_error=direct.output)
+        print(direct.output, end="" if direct.output.endswith("\n") else "\n")
+        return {
+            "target": agent["id"],
+            "status": "direct_probe_failed",
+            "budget_usd": direct.budget_usd,
+            "repaired_auth": repaired_auth,
+        }
+
+    print(f"claude direct probe: ok at budget {direct.budget_usd}")
+    bridge_budget = direct.budget_usd
+    rc = invoke_target(
+        agent,
+        source=source,
+        mode="review",
+        prompt="Liveness check only. Do not inspect files. Reply exactly: BRIDGE_REPAIR_OK",
+        budget_usd=bridge_budget,
+        dry_run=dry_run,
+        budget_auto=True,
+        max_auto_budget_usd=max_auto_budget_usd,
+    )
+    status_name = "ok" if rc == 0 else "bridge_probe_failed"
+    record_agent_connection(agent["id"], last_status=status_name, repaired_auth=repaired_auth)
+    return {
+        "target": agent["id"],
+        "status": status_name,
+        "direct_budget_usd": direct.budget_usd,
+        "repaired_auth": repaired_auth,
+    }
+
+
+def repair_cmd(argv: list[str]) -> int:
+    global PROJECT_DIR
+    parser = argparse.ArgumentParser(prog="agent code repair", description="Check and repair configured Agent Bridge target connections.")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to bridge agent config JSON")
+    parser.add_argument("--project-dir", help="Project/worktree directory. Defaults to the current git root.")
+    parser.add_argument("--from", dest="source", default=os.environ.get("AGENT_BRIDGE_CALLER", "human"))
+    parser.add_argument("--to", dest="targets", default="claude", help="Target agent ids, numbers, comma list, or 'all'")
+    parser.add_argument(
+        "--email",
+        default=os.environ.get("AGENT_BRIDGE_CLAUDE_EMAIL"),
+        help="Email hint for Claude login repair. Defaults to AGENT_BRIDGE_CLAUDE_EMAIL.",
+    )
+    parser.add_argument("--sso", action="store_true", help="Force Claude SSO login during auth repair.")
+    parser.add_argument("--repair-auth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_REPAIR_BUDGET_USD", DEFAULT_REPAIR_BUDGET_USD))
+    parser.add_argument(
+        "--max-auto-budget-usd",
+        default=os.environ.get("AGENT_BRIDGE_MAX_AUTO_BUDGET_USD", DEFAULT_MAX_AUTO_BUDGET_USD),
+        help="Maximum budget cap Agent Bridge may use when calibrating probes.",
+    )
+    parser.add_argument("--auth-timeout", type=int, default=300)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    PROJECT_DIR = Path(args.project_dir).expanduser().resolve() if args.project_dir else discover_project_dir()
+    agents = agent_map(load_config(Path(args.config)))
+    targets = resolve_agent_ids(args.targets, agents)
+    rows: list[dict[str, Any]] = []
+    rc = 0
+    for target_id in targets:
+        agent = agents[target_id]
+        if agent.get("adapter") == "claude_code":
+            row = _repair_claude(
+                agent,
+                source=args.source,
+                email=args.email,
+                sso=args.sso,
+                repair_auth=bool(args.repair_auth),
+                budget_usd=str(args.budget_usd),
+                max_auto_budget_usd=str(args.max_auto_budget_usd),
+                auth_timeout=args.auth_timeout,
+                dry_run=args.dry_run,
+            )
+        else:
+            target_rc = invoke_target(
+                agent,
+                source=args.source,
+                mode="review",
+                prompt="Liveness check only. Reply exactly: BRIDGE_REPAIR_OK",
+                budget_usd=str(args.budget_usd),
+                dry_run=args.dry_run,
+                budget_auto=True,
+                max_auto_budget_usd=str(args.max_auto_budget_usd),
+            )
+            row = {"target": target_id, "status": "ok" if target_rc == 0 else "bridge_probe_failed"}
+        rows.append(row)
+        if row.get("status") != "ok":
+            rc = 1
+    return rc
+
+
 def render_agent_bridge_skill() -> str:
     return f"""---
 name: agent-bridge
@@ -824,6 +1365,17 @@ Use the installed `agent` command as the front door for local and cross-harness 
 - Use `agent code bridge --mode code` only for scoped implementation tasks with an explicit worktree.
 - Use `agent code loop` for adversarial builder/critic/verifier loops; keep budgets explicit when cost matters.
 - Use mailbox MCP for async handoffs. Mailbox messages are the durable proof path; shell process lifetime is secondary.
+
+## Media Handling
+
+- When a bridge or loop prompt references an existing `.heic` or `.heif` file path, Agent Bridge converts it to PNG under `{MEDIA_DIR}` and appends an `[AGENT BRIDGE MEDIA]` note with the converted path.
+- Claude Code dispatches also receive the media cache through `--add-dir`; set `AGENT_BRIDGE_HEIC_CONVERTER` to override the default converter command.
+
+## Connection Repair
+
+- Use `AGENT_BRIDGE_CLAUDE_EMAIL=<email> agent code repair --to claude` when a target CLI reports stale auth, 401 credentials, or budget calibration trouble.
+- Bridge and loop dispatches retry `Exceeded USD budget (...)` failures automatically up to `AGENT_BRIDGE_MAX_AUTO_BUDGET_USD` or `--max-auto-budget-usd`, then persist the working cap under `{CONNECTION_STATE}`.
+- Use `--no-budget-auto` on bridge or loop calls when an explicit hard budget should fail instead of retrying.
 
 ## Shared Registry
 
@@ -1303,7 +1855,13 @@ def parse_loop_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--critic", default="claude", help="Agent id for adversarial review turns")
     parser.add_argument("--verifier", default="claude", help="Agent id for final verification turns")
     parser.add_argument("--max-turns", type=int, default=1)
-    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", "0.50"))
+    parser.add_argument("--budget-usd", default=os.environ.get("AGENT_BRIDGE_BUDGET_USD", DEFAULT_BUDGET_USD))
+    parser.add_argument("--no-budget-auto", action="store_true", help="Disable automatic budget retry/calibration")
+    parser.add_argument(
+        "--max-auto-budget-usd",
+        default=os.environ.get("AGENT_BRIDGE_MAX_AUTO_BUDGET_USD", DEFAULT_MAX_AUTO_BUDGET_USD),
+        help="Maximum budget cap Agent Bridge may use when retrying budget failures.",
+    )
     parser.add_argument(
         "--spawn-policy",
         choices=["auto", "full", "adversarial-only"],
@@ -1362,6 +1920,8 @@ def loop(argv: list[str]) -> int:
     original_prompt = read_prompt(args)
     if not original_prompt:
         raise BridgeError("a loop task prompt is required")
+    media = prepare_prompt_media(original_prompt, project_dir=PROJECT_DIR)
+    original_prompt = media.prompt
     decision = assess_spawn_decision(original_prompt, policy=args.spawn_policy, max_turns=args.max_turns)
 
     base_meta = ensure_run_meta(extract_meta(args))
@@ -1427,6 +1987,9 @@ def loop(argv: list[str]) -> int:
                 budget_usd=str(args.budget_usd),
                 dry_run=args.dry_run,
                 meta=turn_meta,
+                media_dirs=media.media_dirs,
+                budget_auto=not args.no_budget_auto,
+                max_auto_budget_usd=str(args.max_auto_budget_usd),
             )
             parent_id = str(turn_meta["turn_id"])
             if target_rc != 0:
@@ -1457,6 +2020,8 @@ def main(argv: list[str]) -> int:
         return bridge(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "loop":
         return loop(argv[2:])
+    if len(argv) >= 2 and argv[0] == "code" and argv[1] == "repair":
+        return repair_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "trace":
         return trace_cmd(argv[2:])
     if len(argv) >= 2 and argv[0] == "code" and argv[1] == "findings":
@@ -1473,6 +2038,7 @@ def main(argv: list[str]) -> int:
         return bridge(argv[1:])
     print("usage: agent code bridge [options]", file=sys.stderr)
     print("       agent code loop [options]", file=sys.stderr)
+    print("       agent code repair [options]", file=sys.stderr)
     print("       agent code trace [options]", file=sys.stderr)
     print("       agent code findings <create|list|read> [options]", file=sys.stderr)
     print("       agent code verdicts <record|list> [options]", file=sys.stderr)
