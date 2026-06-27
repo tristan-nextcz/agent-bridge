@@ -138,6 +138,38 @@ agent code bridge --from human --to claude --mode review --dry-run \
   --prompt "Show the command you would run."
 ```
 
+HEIC/HEIF image paths in bridge or loop prompts are converted to PNG automatically when the
+source file exists. The converted copies are stored under:
+
+```text
+~/.local/state/agent-bridge/media/
+```
+
+The bridge appends an `[AGENT BRIDGE MEDIA]` note with the PNG path to the dispatched prompt.
+Claude Code targets also receive the media cache through `--add-dir` so the converted image is
+readable. On macOS the default converter is `sips`; otherwise the bridge looks for ImageMagick
+`magick` or `convert`. To supply a custom converter, set `AGENT_BRIDGE_HEIC_CONVERTER` to a
+command prefix; the source path and output path are appended as the final two arguments.
+
+Repair and calibrate target connectivity:
+
+```bash
+AGENT_BRIDGE_CLAUDE_EMAIL=you@example.com agent code repair --to claude
+```
+
+The repair command checks Claude auth status, runs a direct non-interactive Claude probe, refreshes
+Claude login if the probe returns a 401, and then runs a real bridge handshake. It starts with a
+small budget and calibrates upward when the CLI returns `Exceeded USD budget (...)`. Normal
+`agent code bridge` and `agent code loop` dispatches also retry budget failures automatically and
+store the successful cap under:
+
+```text
+~/.local/state/agent-bridge/connections.json
+```
+
+Use `--no-budget-auto` to disable retry/calibration for a specific bridge or loop call, or
+`--max-auto-budget-usd` to cap automatic retries.
+
 Run a bounded adversarial loop:
 
 ```bash
